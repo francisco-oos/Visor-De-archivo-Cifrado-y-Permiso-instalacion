@@ -1,0 +1,3 @@
+-keep class com.frank.visordocumentoscifrado.** { *; }
+-keepattributes *Annotation*
+-dontwarn javax.crypto.**

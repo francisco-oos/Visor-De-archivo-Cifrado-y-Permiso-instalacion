@@ -1,0 +1,45 @@
+.gradle/
+build/
+app/build/
+local.properties
+*.jks
+*.keystore
+*.apk
+*.aab
+.idea/
+.DS_Store
+__pycache__/
+*.pyc
+# Gradle cache local si por error se genera dentro del proyecto
+caches/
+daemon/
+native/
+kotlin-profile/
+.tmp/
+wrapper/
+notifications/
+tools/CLAVE_DOCUMENTOS_NO_ENVIAR.txt
+licencia_*.key
+
+
+# ==========================================================
+# DOCUMENT VAULT (NO SUBIR)
+# ==========================================================
+DocumentVault/
+tools/MANUALES_PARA_ENCRIPTAR/
+tools/MANUALES_CIFRADOS/
+
+# Documentos empresa
+app/src/main/assets/manuales/
+app/src/main/assets/catalogos/
+app/src/main/assets/index.json
+
+# Licencias y solicitudes
+*.key
+*.req
+*.request
+
+# Exportaciones
+exports/
+backup/
+temp/
