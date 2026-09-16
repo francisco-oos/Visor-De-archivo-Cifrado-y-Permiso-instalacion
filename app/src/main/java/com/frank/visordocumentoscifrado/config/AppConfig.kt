@@ -1,24 +1,23 @@
 package com.frank.visordocumentoscifrado.config
 
+import com.frank.visordocumentoscifrado.BuildConfig
+
 /**
  * Configuración central de la APK.
  *
- * Mantén aquí lo que normalmente cambia entre versiones:
- * nombre comercial, vigencia propia de la app, modo debug y rutas de assets.
- *
- * Importante:
- * - APP_EXPIRES_AT protege la versión/producto.
- * - La caducidad de cada empleado pertenece a licencia.key y se validará aparte.
+ * La versión y el modo de depuración ya no se duplican aquí: Gradle/BuildConfig
+ * es la única fuente de verdad. Así una APK release nunca puede quedar por error
+ * con el bypass de licencia usado durante desarrollo.
  */
 object AppConfig {
     const val APP_DISPLAY_NAME = "Visor Seguro de Manuales"
     const val COMPANY_NAME = "Empresa"
     const val PROJECT_NAME = "ALACTE"
 
-    const val VERSION_NAME = "1.1.0"
-    const val VERSION_CODE = 10
+    val VERSION_NAME: String get() = BuildConfig.VERSION_NAME
+    val VERSION_CODE: Int get() = BuildConfig.VERSION_CODE
 
-    /** Vigencia de la APK. Diferente a la vigencia de licencia.key. */
+    /** Vigencia de la APK. Diferente a la vigencia de cada licencia. */
     const val APP_EXPIRES_AT = "2026-12-31"
 
     /** Assets generados por tools/document_encryptor.py. */
@@ -29,16 +28,13 @@ object AppConfig {
     const val INSTALL_ID_KEY = "install_id"
 
     /**
-     * DEBUG_MODE:
-     * - true: permite ver todos los documentos sin licencia para probar cifrado/visor.
-     * - false: flujo real: instalación -> aviso bot -> solicitud -> espera aprobación.
+     * Sólo un build debug con ALLOW_LICENSE_BYPASS=true puede omitir licencia.
+     * La variante release fija ese campo a false desde Gradle.
      */
-    const val DEBUG_MODE = true
+    val DEBUG_MODE: Boolean
+        get() = BuildConfig.DEBUG && BuildConfig.ALLOW_LICENSE_BYPASS
 
-    /**
-     * Preparado para el proyecto futuro de licencias.
-     * En esta APK limpia queda apagado; Telegram solo se usa para enviar eventos.
-     */
+    /** Punto reservado para el transporte HTTP/API futuro. */
     const val LICENSE_STATUS_API_ENABLED = false
     const val LICENSE_STATUS_API_URL = ""
 }

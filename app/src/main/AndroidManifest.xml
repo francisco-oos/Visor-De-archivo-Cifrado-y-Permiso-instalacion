@@ -1,15 +1,22 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
-    <queries>
-        <package android:name="com.whatsapp" />
-        <package android:name="com.whatsapp.w4b" />
-    </queries>
-    <application android:allowBackup="false" android:fullBackupContent="false" android:usesCleartextTraffic="false" android:theme="@style/AppTheme" android:label="Visor Seguro" android:icon="@drawable/ic_logo">
-        <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.fileprovider" android:exported="false" android:grantUriPermissions="true">
-            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
-        </provider>
-        <activity android:name=".ui.PdfActivity" android:screenOrientation="portrait" />
-        <activity android:name=".ui.MainActivity" android:screenOrientation="portrait" android:exported="true">
+
+    <application
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:usesCleartextTraffic="false"
+        android:theme="@style/AppTheme"
+        android:label="Visor Seguro"
+        android:icon="@drawable/ic_logo">
+
+        <activity
+            android:name=".ui.PdfActivity"
+            android:screenOrientation="portrait" />
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:screenOrientation="portrait"
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

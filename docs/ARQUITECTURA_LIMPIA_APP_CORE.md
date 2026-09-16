@@ -1,86 +1,119 @@
-# Arquitectura limpia — VisorDocumentosCifrado App Core
+# Arquitectura limpia — Visor Seguro App Core (R1)
 
-## Enfoque actual
+## Responsabilidades actuales
 
-Este repositorio queda reducido a dos responsabilidades:
+El repositorio mantiene dos productos técnicos:
 
 1. **APK Visor Seguro**
-   - Contiene manuales cifrados en `assets/manuales`.
-   - Envía aviso de instalación al bot.
-   - Envía solicitud de acceso al bot.
-   - Espera un archivo `licencia.key`.
-   - Al recibir licencia válida, muestra documentos según áreas permitidas.
+   - catálogo y control de acceso por área;
+   - lectura VSDOC1/VSDOC2;
+   - visor PDF FIX25;
+   - identidad de instalación;
+   - verificación local de licencia;
+   - contrato neutral de activación.
 
 2. **Encriptador de manuales**
-   - Crea carpetas por departamento.
-   - Permite agregar, renombrar, mover y eliminar PDFs.
-   - Cifra documentos como `VSDOC2`.
-   - Genera `index.json`.
-   - Coloca `.bin` e `index.json` en `app/src/main/assets/manuales`.
-   - Actualiza `DocumentKeyConfig.kt`.
+   - crea carpetas oficiales;
+   - administra PDFs fuente;
+   - cifra VSDOC2;
+   - genera `index.json`;
+   - exporta temporalmente a `app/src/main/assets/manuales`;
+   - guarda la clave local en `visor-secrets.properties` fuera de Git.
 
-## Lo que se quitó de este repositorio
-
-- Centro de licencias.
-- Generador de licencias.
-- Aprobación/rechazo/renovación.
-- Lectura de solicitudes desde Telegram para aprobar.
-
-Eso será otro proyecto: **frontend/API de licenciamiento**.
-
-## Flujo
+## Capas R1
 
 ```text
-PC:
-tools/ABRIR_ENCRIPTADOR.bat
-  -> crea MANUALES_PARA_ENCRIPTAR/
-  -> cifra PDFs
-  -> coloca assets en la APK
-  -> actualiza DocumentKeyConfig.kt
+ui/
+  MainActivity
+  PdfActivity
+  ZoomImageView
 
-Android:
-instala APK
-  -> avisa instalación al bot
-  -> usuario presiona Enviar solicitud de acceso
-  -> llega .req al bot/admin
-  -> app queda esperando licencia.key
+activation/
+  ActivationTransport
+  ActivationTransportProvider
+  TelegramActivationTransport (debug temporal)
 
-Futuro frontend:
-recibe solicitud
-  -> aprueba/rechaza/renueva
-  -> genera licencia.key
-  -> define áreas permitidas y caducidad
+license/
+  ActivationStatusClient
+  LicenseManager
+  LicenseSignatureVerifier
+  LicenseAccessPolicy
+  LicenseModels
+
+documents/
+  DocumentRepository
+  DocumentAccessGuard
+
+security/
+  CryptoUtils
+  DeviceIdentity
+  RootDetector
+
+config/
+  AppConfig
+  AreaCatalog
+  SecurityConfig
+  DocumentKeyConfig (fachada BuildConfig V1/V2)
+  LicenseSecurityConfig
+  TelegramConfig (debug)
 ```
 
-## Catálogo oficial de departamentos
+## Frontera debug/release
 
-- - ADQUISICION
-- PERFORACION
-- TOPOGRAFIA
-- GESTORIA
-- LOGISTICA
-- OPERACIONES
-- INMUEBLES
-- QC
+`BuildConfig` es la única fuente de verdad para versión y bypass.
 
-Para ver todos los documentos se usará `access_mode = ALL` en la licencia futura; no existe carpeta GENERAL.
+- debug: package `.debug`, puede habilitar bypass para probar el lector;
+- release: bypass fijo en `false`, Telegram directo desactivado y sin token/chat ID.
+
+## Licencia
+
+Productivo:
+
+```text
+VISOR_LICENSE_V2
+payload_b64
+     ↓ firma ECDSA P-256 / SHA-256
+private key: servidor/admin
+public key: APK
+```
+
+La licencia V1/HMAC sólo queda disponible en debug como compatibilidad temporal.
 
 ## Seguridad por área
 
-La UI filtra documentos por licencia, pero además `DocumentAccessGuard.kt` valida justo antes de descifrar.
+La UI filtra documentos, pero `DocumentAccessGuard` vuelve a comprobar autorización antes del descifrado. VSDOC2 incluye metadata interna autenticada mediante AES-GCM/AAD para detectar manipulación entre `index.json` y el documento.
 
-El `.bin` VSDOC2 incluye metadatos internos autenticados con AES-GCM:
+`ALL` representa acceso global. No existe carpeta GENERAL.
 
-- título
-- archivo
-- área
-- sha256 del PDF original
+## Activación
 
-Así, aunque alguien modifique `index.json`, la app vuelve a validar el área interna del documento.
+La UI no conoce Telegram:
+
+```text
+MainActivity
+     ↓
+ActivationTransportProvider
+     ↓
+ActivationTransport
+```
+
+Telegram es sólo una implementación debug. La futura API sustituirá esa implementación, no la pantalla.
+
+## Secretos
+
+No se versionan secretos nuevos. `visor-secrets.properties` está en `.gitignore`.
+
+La clave VSDOC1/VSDOC2 todavía termina en la APK para conservar compatibilidad; se considera deuda transitoria y está explícitamente programada para desaparecer con VSDOC3.
+
+## Motor PDF
+
+FIX25 se conserva sin reescritura en R1. El roadmap detallado está en `ROADMAP_VSDOC3_VIEWER.md`.
+
+La siguiente etapa introducirá sesión, streaming VSDOC2, trabajos asíncronos, caché ponderada, viewport/render scheduler y posteriormente VSDOC3 seekable.
 
 ## Vigencias separadas
 
-- `AppConfig.APP_EXPIRES_AT`: caducidad de la APK/producto.
-- `licencia.key / expires_at`: caducidad del permiso del empleado.
+- `AppConfig.APP_EXPIRES_AT`: vigencia de la versión/producto.
+- `license.expires_at`: vigencia del permiso del empleado.
 
-Actualizar APK encima no debe renovar licencia.
+Actualizar la APK no debe renovar automáticamente la licencia.

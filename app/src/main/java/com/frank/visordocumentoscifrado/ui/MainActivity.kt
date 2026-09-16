@@ -8,6 +8,7 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
+import com.frank.visordocumentoscifrado.activation.ActivationTransportProvider
 import com.frank.visordocumentoscifrado.config.AppConfig
 import com.frank.visordocumentoscifrado.config.AreaCatalog
 import com.frank.visordocumentoscifrado.config.DebugCatalog
@@ -17,7 +18,6 @@ import com.frank.visordocumentoscifrado.license.ActivationStatusClient
 import com.frank.visordocumentoscifrado.license.LicenseManager
 import com.frank.visordocumentoscifrado.security.DeviceIdentity
 import com.frank.visordocumentoscifrado.security.RootDetector
-import com.frank.visordocumentoscifrado.telegram.TelegramRequestSender
 import org.json.JSONObject
 import java.time.LocalDate
 import java.time.LocalDateTime
@@ -25,14 +25,14 @@ import java.time.LocalDateTime
 /**
  * Pantalla principal de la APK.
  *
- * Responsabilidades de este AppCore:
- * - Notificar instalación al bot una sola vez.
- * - Capturar datos mínimos y enviar solicitud de acceso de forma oculta.
- * - Consultar estado al abrir la app usando el hash/install_id del equipo.
- * - Mostrar documentos cifrados si existe licencia válida o si DEBUG_MODE=true.
+ * Responsabilidades del AppCore:
+ * - notificar instalación por el transporte de activación disponible;
+ * - capturar y enviar una solicitud de acceso;
+ * - consultar estado mediante ActivationStatusClient;
+ * - mostrar documentos permitidos por licencia o, sólo en build debug, habilitar
+ *   el bypass de desarrollo.
  *
- * El usuario no ve JSON, archivos .req ni detalles de Telegram. El proyecto futuro
- * de licencias/frontend será quien apruebe, rechace y genere license_text.
+ * La UI no conoce Telegram ni conocerá la futura API productiva.
  */
 class MainActivity : AppCompatActivity() {
     private lateinit var container: LinearLayout
@@ -43,7 +43,7 @@ class MainActivity : AppCompatActivity() {
             window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         }
         notifyInstallOnce()
-        refreshActivationFromTelegramOnOpen()
+        refreshActivationOnOpen()
         showHome()
     }
 
@@ -107,7 +107,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun selectedCatalogValue(spinner: Spinner, otherInput: EditText): String {
         val value = spinner.selectedItem?.toString().orEmpty()
-        return if (value.equals("Otro", ignoreCase = true)) otherInput.text.toString().trim() else value
+        val isOther = value.equals("Otro", ignoreCase = true) ||
+            value.equals(AreaCatalog.OTRO, ignoreCase = true)
+        return if (isOther) otherInput.text.toString().trim() else value
     }
 
     private fun showHome() {
@@ -149,6 +151,7 @@ class MainActivity : AppCompatActivity() {
         container.addView(label("Documentos visibles: ${DocumentRepository.listAllowed(this).size}"))
         container.addView(label("Device hash: ${DeviceIdentity.deviceHash(this).take(18)}..."))
         container.addView(label("Install ID: ${DeviceIdentity.installId(this)}"))
+        container.addView(label("Transporte activación: ${ActivationTransportProvider.current().name}"))
         container.addView(button("Regresar").apply { setOnClickListener { showHome() } })
     }
 
@@ -163,7 +166,21 @@ class MainActivity : AppCompatActivity() {
         }
 
         container.addView(statusLabel("Equipo pendiente de autorización"))
-        container.addView(label("Captura tus datos y presiona Solicitar acceso. La aplicación consultará automáticamente el estado cuando la abras."))
+        if (!ActivationTransportProvider.current().isConfigured()) {
+            container.addView(
+                label(
+                    "El canal productivo de activación todavía no está configurado. " +
+                        "Esta rama puede probarse como build debug; la API se conectará después al mismo contrato."
+                )
+            )
+        } else {
+            container.addView(
+                label(
+                    "Captura tus datos y presiona Solicitar acceso. La aplicación consultará automáticamente " +
+                        "el estado cuando la abras."
+                )
+            )
+        }
 
         val name = input("Nombre completo", 80)
         val id = input("ID empleado", 20, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS)
@@ -261,7 +278,7 @@ class MainActivity : AppCompatActivity() {
         container.addView(button("Actualizar pantalla").apply { setOnClickListener { showHome() } })
     }
 
-    private fun refreshActivationFromTelegramOnOpen() {
+    private fun refreshActivationOnOpen() {
         if (AppConfig.DEBUG_MODE || LicenseManager.current(this) != null) return
         val hasRequest = getSharedPreferences("request_state", MODE_PRIVATE).getString("last_request_id", null) != null
         if (!hasRequest) return
@@ -282,6 +299,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun notifyInstallOnce() {
+        val transport = ActivationTransportProvider.current()
+        if (!transport.isConfigured()) return
+
         val prefs = getSharedPreferences("request_state", MODE_PRIVATE)
         if (prefs.getBoolean("install_notice_sent", false)) return
 
@@ -296,7 +316,7 @@ class MainActivity : AppCompatActivity() {
             eventType = "INSTALL_EVENT"
         )
 
-        TelegramRequestSender.sendEvent(this, request) { ok, _ ->
+        transport.sendEvent(this, request) { ok, _ ->
             if (ok) prefs.edit().putBoolean("install_notice_sent", true).apply()
         }
     }
@@ -345,7 +365,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun sendAccessRequest(request: JSONObject) {
-        TelegramRequestSender.sendEvent(this, request) { ok, msg ->
+        val transport = ActivationTransportProvider.current()
+        transport.sendEvent(this, request) { ok, msg ->
             if (ok) {
                 getSharedPreferences("request_state", MODE_PRIVATE)
                     .edit()

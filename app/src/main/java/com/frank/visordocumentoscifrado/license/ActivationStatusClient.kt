@@ -1,16 +1,14 @@
 package com.frank.visordocumentoscifrado.license
 
 import android.content.Context
+import com.frank.visordocumentoscifrado.activation.ActivationTransportProvider
 import com.frank.visordocumentoscifrado.config.AppConfig
-import com.frank.visordocumentoscifrado.telegram.TelegramStatusClient
 
 /**
  * Punto único para consultar el estado de activación del equipo.
  *
- * Arquitectura limpia:
- * - Hoy consulta Telegram como canal temporal sin dominio.
- * - Mañana puede consultar una API real sin cambiar MainActivity.
- * - Si llega APPROVED con license_text, guarda la licencia localmente.
+ * MainActivity no conoce Telegram ni conocerá la futura API. Sólo este cliente y
+ * ActivationTransportProvider resuelven el canal disponible.
  */
 data class ActivationStatusResult(
     val status: String,
@@ -27,22 +25,33 @@ object ActivationStatusClient {
         }
 
         if (AppConfig.LICENSE_STATUS_API_ENABLED) {
-            // Proyecto futuro Frontend/API:
-            // POST AppConfig.LICENSE_STATUS_API_URL con device_hash + install_id.
-            callback(ActivationStatusResult("PENDING", "Consulta API aún no implementada."))
+            // Reservado para ApiActivationTransport en la siguiente etapa del proyecto.
+            callback(ActivationStatusResult("PENDING", "La API de activación aún no está implementada."))
             return
         }
 
-        TelegramStatusClient.check(context) { response ->
+        val transport = ActivationTransportProvider.current()
+        transport.checkStatus(context) { response ->
             if (response.status == "APPROVED" && !response.licenseText.isNullOrBlank()) {
                 val saved = LicenseManager.save(context, response.licenseText)
                 if (saved.first) {
                     callback(ActivationStatusResult("APPROVED", "Acceso aprobado. Licencia guardada."))
                 } else {
-                    callback(ActivationStatusResult("PENDING", "Se recibió aprobación, pero la licencia no es válida: ${saved.second}"))
+                    callback(
+                        ActivationStatusResult(
+                            "PENDING",
+                            "Se recibió aprobación, pero la licencia no es válida: ${saved.second}"
+                        )
+                    )
                 }
             } else {
-                callback(ActivationStatusResult(response.status, response.message, response.licenseText))
+                callback(
+                    ActivationStatusResult(
+                        response.status,
+                        response.message,
+                        response.licenseText
+                    )
+                )
             }
         }
     }

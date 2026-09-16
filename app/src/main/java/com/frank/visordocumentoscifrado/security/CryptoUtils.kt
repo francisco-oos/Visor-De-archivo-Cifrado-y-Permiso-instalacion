@@ -1,23 +1,22 @@
 package com.frank.visordocumentoscifrado.security
 
-import android.util.Base64
 import java.security.MessageDigest
+import java.util.Base64
 import javax.crypto.Cipher
 import javax.crypto.Mac
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
+/** Utilidades criptográficas pequeñas y testeables sin depender de android.util.Base64. */
 object CryptoUtils {
     fun sha256Hex(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 
     fun sha256Hex(text: String): String = sha256Hex(text.toByteArray(Charsets.UTF_8))
 
-    fun b64(bytes: ByteArray): String =
-        Base64.encodeToString(bytes, Base64.NO_WRAP)
+    fun b64(bytes: ByteArray): String = Base64.getEncoder().encodeToString(bytes)
 
-    fun b64d(text: String): ByteArray =
-        Base64.decode(text, Base64.NO_WRAP)
+    fun b64d(text: String): ByteArray = Base64.getDecoder().decode(text.trim())
 
     fun hmacSha256(key: ByteArray, data: String): String =
         hmacSha256Base64(key, data.toByteArray(Charsets.UTF_8))
@@ -28,7 +27,19 @@ object CryptoUtils {
         return b64(mac.doFinal(data))
     }
 
-    fun aesGcmDecrypt(key: ByteArray, nonce: ByteArray, cipherText: ByteArray, aad: ByteArray? = null): ByteArray {
+    /** Comparación resistente a diferencias de tiempo para firmas/códigos autenticados. */
+    fun secureEquals(left: String, right: String): Boolean =
+        MessageDigest.isEqual(
+            left.toByteArray(Charsets.UTF_8),
+            right.toByteArray(Charsets.UTF_8)
+        )
+
+    fun aesGcmDecrypt(
+        key: ByteArray,
+        nonce: ByteArray,
+        cipherText: ByteArray,
+        aad: ByteArray? = null
+    ): ByteArray {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
         if (aad != null) cipher.updateAAD(aad)

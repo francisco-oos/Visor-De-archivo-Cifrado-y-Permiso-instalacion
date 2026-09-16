@@ -5,6 +5,7 @@ import com.frank.visordocumentoscifrado.config.AppConfig
 import com.frank.visordocumentoscifrado.config.AreaCatalog
 import com.frank.visordocumentoscifrado.config.DocumentKeyConfig
 import com.frank.visordocumentoscifrado.config.LicensePolicy
+import com.frank.visordocumentoscifrado.config.LicenseSecurityConfig
 import com.frank.visordocumentoscifrado.security.CryptoUtils
 import com.frank.visordocumentoscifrado.security.DeviceIdentity
 import org.json.JSONArray
@@ -14,24 +15,17 @@ import java.time.LocalDate
 /**
  * Cliente local de licencia.
  *
- * Este módulo NO genera licencias. Solo:
- * 1) carga licencia.key cuando el usuario la recibe,
- * 2) valida firma, teléfono, instalación, caducidad y áreas permitidas,
- * 3) decide qué documentos puede abrir el usuario.
- *
- * Formato recomendado para el futuro frontend:
- * {
- *   "schema": "VISOR_LICENSE_V1",
- *   "payload_b64": "base64(json_payload_utf8)",
- *   "signature": "HMAC_SHA256_BASE64(payload_b64, APP_VERIFY_SECRET)"
- * }
+ * Seguridad R1:
+ * - VISOR_LICENSE_V2 se verifica con ECDSA P-256/SHA-256.
+ * - La APK sólo contiene la clave pública de verificación.
+ * - VISOR_LICENSE_V1/HMAC se acepta únicamente en build debug y sólo si existe
+ *   LEGACY_LICENSE_HMAC_SECRET en visor-secrets.properties.
+ * - La validación de licencia ya no depende de que exista una clave de documentos;
+ *   esa clave se valida justo al intentar abrir un documento VSDOC1/VSDOC2.
  */
 object LicenseManager {
     private const val PREF = "license_store"
     private const val LICENSE = AppConfig.LICENSE_FILE_NAME
-
-    // Debe coincidir con tools/app_constants.py y con el futuro frontend/API.
-    private const val PUBLIC_VERIFY_SECRET = "CAMBIA-ESTE-SECRETO-ANTES-DE-COMPILAR-V1"
 
     fun save(context: Context, text: String): Pair<Boolean, String> {
         val result = validate(context, text)
@@ -52,20 +46,35 @@ object LicenseManager {
 
     fun validate(context: Context, licenseText: String): Pair<Boolean, String> {
         return try {
-            validateEmbeddedDocumentKey().let { if (!it.first) return it }
-
             val payload = payloadObject(licenseText)
             val lic = payloadToLicense(payload)
 
-            if (LicensePolicy.REQUIRE_DEVICE_HASH && lic.deviceHash != DeviceIdentity.deviceHash(context)) {
-                return false to "La licencia no corresponde a este teléfono."
+            if (LicensePolicy.REQUIRE_EMPLOYEE_DATA) {
+                if (lic.employeeName.isBlank() || lic.employeeId.isBlank() || lic.position.isBlank()) {
+                    return false to "La licencia no contiene datos mínimos del empleado."
+                }
             }
-            if (LicensePolicy.REQUIRE_INSTALL_ID && lic.installId != DeviceIdentity.installId(context)) {
-                return false to "La licencia no corresponde a esta instalación."
+
+            if (LicensePolicy.REQUIRE_DEVICE_HASH) {
+                if (lic.deviceHash.isBlank()) return false to "La licencia no contiene device_hash."
+                if (lic.deviceHash != DeviceIdentity.deviceHash(context)) {
+                    return false to "La licencia no corresponde a este teléfono."
+                }
+            }
+
+            if (LicensePolicy.REQUIRE_INSTALL_ID) {
+                if (lic.installId.isBlank()) return false to "La licencia no contiene install_id."
+                if (lic.installId != DeviceIdentity.installId(context)) {
+                    return false to "La licencia no corresponde a esta instalación."
+                }
+            }
+
+            if (LicensePolicy.REQUIRE_EXPIRATION_DATE && lic.expiresAt.isBlank()) {
+                return false to "La licencia no contiene fecha de caducidad."
             }
 
             val today = LocalDate.now()
-            if (LicensePolicy.REQUIRE_EXPIRATION_DATE && today.isAfter(LocalDate.parse(lic.expiresAt))) {
+            if (lic.expiresAt.isNotBlank() && today.isAfter(LocalDate.parse(lic.expiresAt))) {
                 return false to "La licencia caducó el ${lic.expiresAt}."
             }
             if (today.isAfter(LocalDate.parse(AppConfig.APP_EXPIRES_AT))) {
@@ -80,48 +89,79 @@ object LicenseManager {
 
     private fun payloadObject(licenseText: String): JSONObject {
         val obj = JSONObject(licenseText.trim())
+        val schema = obj.optString("schema")
 
-        // Formato nuevo y estable para frontend futuro.
-        if (obj.optString("schema") == "VISOR_LICENSE_V1" && obj.has("payload_b64")) {
+        if (schema == LicenseSecurityConfig.SIGNED_SCHEMA && obj.has("payload_b64")) {
             val payloadB64 = obj.getString("payload_b64")
             val signature = obj.getString("signature")
-            val expected = CryptoUtils.hmacSha256Base64(
-                PUBLIC_VERIFY_SECRET.toByteArray(Charsets.UTF_8),
-                payloadB64.toByteArray(Charsets.UTF_8)
-            )
-            if (signature != expected) throw SecurityException("Firma de licencia inválida.")
-            val json = String(CryptoUtils.b64d(payloadB64), Charsets.UTF_8)
-            return JSONObject(json)
+            val publicKey = LicenseSecurityConfig.VERIFY_PUBLIC_KEY_B64
+            if (publicKey.isBlank()) {
+                throw SecurityException("La APK no tiene configurada la clave pública de licencias V2.")
+            }
+            if (!LicenseSignatureVerifier.verifyEcdsaP256Sha256(publicKey, payloadB64, signature)) {
+                throw SecurityException("Firma de licencia V2 inválida.")
+            }
+            return JSONObject(String(CryptoUtils.b64d(payloadB64), Charsets.UTF_8))
         }
 
-        // Compatibilidad temporal con licencias antiguas tipo {payload, signature}.
-        val payload = obj.getJSONObject("payload")
-        val signature = obj.getString("signature")
-        val canonical = payload.toString()
-        val expectedLegacy = CryptoUtils.hmacSha256(
-            PUBLIC_VERIFY_SECRET.toByteArray(Charsets.UTF_8),
-            canonical
-        )
-        if (signature != expectedLegacy) throw SecurityException("Firma de licencia inválida.")
-        return payload
+        if (schema == LicenseSecurityConfig.LEGACY_SCHEMA && obj.has("payload_b64")) {
+            if (!AppConfig.DEBUG_MODE) {
+                throw SecurityException("VISOR_LICENSE_V1 no está permitido en una APK release.")
+            }
+            val payloadB64 = obj.getString("payload_b64")
+            val signature = obj.getString("signature")
+            val secret = LicenseSecurityConfig.LEGACY_HMAC_SECRET
+            if (!LicenseSignatureVerifier.verifyLegacyHmac(secret, payloadB64, signature)) {
+                throw SecurityException("Firma de licencia V1 inválida.")
+            }
+            return JSONObject(String(CryptoUtils.b64d(payloadB64), Charsets.UTF_8))
+        }
+
+        // Compatibilidad con el formato histórico {payload, signature}; sólo debug.
+        if (obj.has("payload") && obj.has("signature")) {
+            if (!AppConfig.DEBUG_MODE) {
+                throw SecurityException("Formato de licencia legado no permitido en release.")
+            }
+            val payload = obj.getJSONObject("payload")
+            val signature = obj.getString("signature")
+            val secret = LicenseSecurityConfig.LEGACY_HMAC_SECRET
+            if (secret.isBlank()) throw SecurityException("Secreto legado no configurado.")
+            val expected = CryptoUtils.hmacSha256(secret.toByteArray(Charsets.UTF_8), payload.toString())
+            if (!CryptoUtils.secureEquals(expected, signature)) {
+                throw SecurityException("Firma de licencia legada inválida.")
+            }
+            return payload
+        }
+
+        throw SecurityException("Esquema de licencia no soportado: ${schema.ifBlank { "SIN_SCHEMA" }}")
     }
 
     private fun parsePayload(text: String): LicenseData = payloadToLicense(payloadObject(text))
 
     private fun payloadToLicense(p: JSONObject): LicenseData {
+        val rawArea = p.optString("area", "").trim()
+        val normalizedArea = if (rawArea.isBlank()) "" else AreaCatalog.normalize(rawArea)
+        val explicitAllowed = jsonArrayToList(p.optJSONArray("allowed_areas"))
+        val allowed = if (explicitAllowed.isNotEmpty()) {
+            explicitAllowed
+        } else if (normalizedArea.isNotBlank()) {
+            listOf(normalizedArea)
+        } else {
+            emptyList()
+        }
+
         return LicenseData(
-            employeeName = p.optString("employee_name"),
-            employeeId = p.optString("employee_id"),
-            project = p.optString("project"),
-            area = AreaCatalog.normalize(p.optString("area")),
-            position = p.optString("position"),
-            deviceHash = p.optString("device_hash"),
-            installId = p.optString("install_id"),
-            expiresAt = p.optString("expires_at"),
-            issuedAt = p.optString("issued_at"),
-            accessMode = p.optString("access_mode", "AREA"),
-            allowedAreas = jsonArrayToList(p.optJSONArray("allowed_areas"))
-                .ifEmpty { listOf(AreaCatalog.normalize(p.optString("area", AreaCatalog.OTRO))) }
+            employeeName = p.optString("employee_name").trim(),
+            employeeId = p.optString("employee_id").trim(),
+            project = p.optString("project").trim(),
+            area = normalizedArea,
+            position = p.optString("position").trim(),
+            deviceHash = p.optString("device_hash").trim(),
+            installId = p.optString("install_id").trim(),
+            expiresAt = p.optString("expires_at").trim(),
+            issuedAt = p.optString("issued_at").trim(),
+            accessMode = p.optString("access_mode", "AREA").trim(),
+            allowedAreas = allowed
         )
     }
 
@@ -129,59 +169,48 @@ object LicenseManager {
         if (arr == null) return emptyList()
         val out = mutableListOf<String>()
         for (i in 0 until arr.length()) {
-            val item = AreaCatalog.normalize(arr.optString(i))
+            val raw = arr.optString(i).trim()
+            if (raw.isBlank()) continue
+            val item = AreaCatalog.normalize(raw)
             if (item.isNotBlank()) out.add(item)
         }
         return out.distinct()
-    }
-
-    private fun validateEmbeddedDocumentKey(): Pair<Boolean, String> {
-        return try {
-            if (DocumentKeyConfig.EMBEDDED_DOCUMENT_KEY_B64.isBlank()) {
-                return false to "La APK no tiene clave de documentos. Cifra manuales con la herramienta y recompila."
-            }
-            val key = CryptoUtils.b64d(DocumentKeyConfig.EMBEDDED_DOCUMENT_KEY_B64.trim())
-            if (key.size != 32) return false to "Clave de documentos inválida. Debe ser AES-256."
-            val fp = CryptoUtils.sha256Hex(key)
-            if (DocumentKeyConfig.DOCUMENT_KEY_SHA256.isNotBlank() &&
-                fp != DocumentKeyConfig.DOCUMENT_KEY_SHA256.lowercase()) {
-                return false to "La huella de la clave no coincide. Recifra manuales y recompila."
-            }
-            true to "OK"
-        } catch (e: Exception) {
-            false to "No se pudo leer la clave de documentos: ${e.message}"
-        }
     }
 
     fun clear(context: Context) {
         context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit().remove(LICENSE).apply()
     }
 
+    /**
+     * Devuelve la clave transitoria VSDOC1/VSDOC2 tras validar presencia, tamaño y huella.
+     * La autorización del usuario se comprueba antes salvo en la variante debug separada.
+     */
     fun documentKey(context: Context): ByteArray {
         if (!AppConfig.DEBUG_MODE) current(context) ?: throw IllegalStateException("Sin licencia válida.")
-        val key = CryptoUtils.b64d(DocumentKeyConfig.EMBEDDED_DOCUMENT_KEY_B64.trim())
-        if (key.size != 32) throw IllegalStateException("Clave embebida inválida.")
+
+        val encoded = DocumentKeyConfig.EMBEDDED_DOCUMENT_KEY_B64.trim()
+        if (encoded.isBlank()) {
+            throw IllegalStateException(
+                "La compilación no tiene DOCUMENT_KEY_B64. Ejecuta el encriptador para generar visor-secrets.properties."
+            )
+        }
+
+        val key = CryptoUtils.b64d(encoded)
+        if (key.size != 32) throw IllegalStateException("Clave de documentos inválida. Debe ser AES-256.")
+
+        val expectedFingerprint = DocumentKeyConfig.DOCUMENT_KEY_SHA256.trim().lowercase()
+        if (expectedFingerprint.isNotBlank()) {
+            val actual = CryptoUtils.sha256Hex(key)
+            if (!CryptoUtils.secureEquals(actual, expectedFingerprint)) {
+                throw IllegalStateException("La huella de la clave de documentos no coincide.")
+            }
+        }
         return key
     }
 
-    /**
-     * Indica si la licencia tiene permiso global.
-     *
-     * Regla de negocio:
-     * - ALL/TODOS/TODAS = permiso global.
-     * - OTRO se mantiene en formulario, pero si llega en licencia se interpreta como ALL.
-     *   Esto evita que una licencia aprobada como "Otro" bloquee documentos.
-     */
-    fun hasAllAccess(license: LicenseData): Boolean {
-        val mode = AreaCatalog.normalize(license.accessMode)
-        if (mode == AreaCatalog.ALL) return true
-        if (AreaCatalog.normalize(license.area) == AreaCatalog.ALL) return true
-        return license.allowedAreas.any { AreaCatalog.normalize(it) == AreaCatalog.ALL }
-    }
+    fun hasAllAccess(license: LicenseData): Boolean =
+        LicenseAccessPolicy.hasAllAccess(license)
 
-    fun canAccessArea(license: LicenseData, areaId: String): Boolean {
-        if (hasAllAccess(license)) return true
-        val normalized = AreaCatalog.normalize(areaId)
-        return license.allowedAreas.any { AreaCatalog.normalize(it) == normalized }
-    }
+    fun canAccessArea(license: LicenseData, areaId: String): Boolean =
+        LicenseAccessPolicy.canAccessArea(license, areaId)
 }

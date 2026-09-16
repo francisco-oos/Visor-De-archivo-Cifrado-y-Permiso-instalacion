@@ -1,16 +1,18 @@
 # FIX22 — Flujo oculto de solicitud y estado
 
-## Objetivo
+> **Documento histórico.** Describe la etapa previa a Hardening R1. Desde R1 la UI usa `ActivationTransport` y Telegram directo sólo puede existir en `debug`; consulta `ARQUITECTURA_LIMPIA_APP_CORE.md` y `ADR_002_ACTIVATION_TRANSPORT.md` para el estado actual.
+
+## Objetivo original
 
 Limpiar la APK para que el usuario no vea ni manipule JSON, `.req` ni detalles de Telegram.
 
-La APK queda con este alcance:
+La APK quedó entonces con este alcance:
 
-1. Al instalarse por primera vez envía `INSTALL_EVENT` al bot.
-2. El usuario rellena sus datos y presiona **Solicitar acceso**.
-3. La APK envía `ACCESS_REQUEST` al bot por el canal configurado.
-4. La APK queda en estado **En revisión**.
-5. En próximas aperturas permite consultar estado mediante `ActivationStatusClient`.
+1. Al instalarse por primera vez enviaba `INSTALL_EVENT` al bot.
+2. El usuario rellenaba sus datos y presionaba **Solicitar acceso**.
+3. La APK enviaba `ACCESS_REQUEST` al bot por el canal configurado.
+4. La APK quedaba en estado **En revisión**.
+5. En próximas aperturas consultaba estado mediante `ActivationStatusClient`.
 
 ## Lo que se eliminó de la experiencia del usuario
 
@@ -19,49 +21,14 @@ La APK queda con este alcance:
 - Mención de Telegram en la pantalla de solicitud.
 - Carga manual visible de `licencia.key`.
 
-## Lo que se conserva internamente
+## Lo que se conservó internamente
 
-- `LicenseManager`: preparado para validar una licencia futura.
-- `ActivationStatusClient`: punto único para conectar el futuro frontend/API.
-- `TelegramRequestSender`: solo envía eventos de instalación/solicitud.
-- `DocumentRepository` y `DocumentAccessGuard`: mantienen seguridad por área antes de descifrar.
+- `LicenseManager`.
+- `ActivationStatusClient`.
+- `DocumentRepository` y `DocumentAccessGuard`.
 
-## Eventos enviados al bot
+## Evolución R1
 
-### INSTALL_EVENT
+`MainActivity` ya no llama a `TelegramRequestSender` directamente. El transporte está detrás de `ActivationTransportProvider` y la futura API podrá reemplazar el puente temporal sin modificar la UI.
 
-Se envía automáticamente una sola vez por instalación.
-
-Sirve para saber que alguien instaló la APK aunque no haya solicitado acceso.
-
-### ACCESS_REQUEST
-
-Se envía cuando el usuario presiona **Solicitar acceso**.
-
-Sirve para el futuro frontend de licencias.
-
-## Futuro frontend/API
-
-Cuando exista el proyecto externo de licencias, se conectará en:
-
-```text
-app/src/main/java/com/frank/visordocumentoscifrado/license/ActivationStatusClient.kt
-```
-
-Ahí se consultará por:
-
-- `device_hash`
-- `install_id`
-- `app_version`
-
-Y la API responderá:
-
-- `PENDING`
-- `APPROVED` + licencia
-- `REJECTED`
-- `EXPIRED`
-
-## Seguridad
-
-La app no muestra documentos sin licencia salvo en `DEBUG_MODE=true`.
-La UI oculta áreas, pero además `DocumentAccessGuard` vuelve a validar justo antes de descifrar.
+La regla de seguridad sigue siendo: una APK `release` no muestra/abre documentos sin licencia válida; el bypass existe únicamente en la variante `debug` separada.

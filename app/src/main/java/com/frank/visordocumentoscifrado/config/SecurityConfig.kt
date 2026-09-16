@@ -1,8 +1,6 @@
 package com.frank.visordocumentoscifrado.config
 
-/**
- * Políticas de seguridad ajustables.
- */
+/** Políticas de seguridad ajustables. */
 object SecurityConfig {
     /** Bloquea capturas y grabación de pantalla donde Android lo respeta. */
     const val BLOCK_SCREENSHOTS = true
@@ -13,7 +11,7 @@ object SecurityConfig {
     /** Obliga que toda licencia tenga fecha de caducidad. */
     const val REQUIRE_LICENSE_EXPIRATION = true
 
-    /** Algoritmo acordado para PDFs y licencia local. */
-    const val PDF_CRYPTO_ALGORITHM = "AES-256-GCM"
-    const val LICENSE_SIGNATURE_ALGORITHM = "HMAC-SHA256-V1"
+    /** Algoritmos activos/objetivo. */
+    const val PDF_CRYPTO_ALGORITHM = "AES-256-GCM (VSDOC1/VSDOC2 legado)"
+    const val LICENSE_SIGNATURE_ALGORITHM = "ECDSA-P256-SHA256 (VISOR_LICENSE_V2)"
 }

@@ -1,14 +1,21 @@
 package com.frank.visordocumentoscifrado.config
 
+import com.frank.visordocumentoscifrado.BuildConfig
+
 /**
- * Clave maestra de documentos embebida en la APK.
+ * Compatibilidad transitoria VSDOC1/VSDOC2.
  *
- * La genera tools/document_encryptor.py al cifrar los manuales.
- * No pertenece a licencia.key. La licencia solo decide qué áreas puede ver el usuario.
+ * La clave ya NO vive en Git. tools/document_encryptor.py la guarda en
+ * visor-secrets.properties (ignorado por Git) y Gradle la inyecta al compilar.
  *
- * Si vuelves a cifrar con nueva clave, recompila la APK.
+ * Advertencia arquitectónica: la clave todavía termina dentro de la APK y por ello
+ * puede extraerse con ingeniería inversa. VSDOC3 reemplazará este mecanismo por
+ * claves de contenido protegidas por instalación/Android Keystore.
  */
 object DocumentKeyConfig {
-    const val EMBEDDED_DOCUMENT_KEY_B64 = "elzRMlQhBW/xfMQIZwirspW0diN1xCBaxiAQj23JwCE="
-    const val DOCUMENT_KEY_SHA256 = "311984fce63f096f06fb74cadccbffdda952d8a568af4f9c857e7dcbfe0529c3"
+    val EMBEDDED_DOCUMENT_KEY_B64: String
+        get() = BuildConfig.DOCUMENT_KEY_B64
+
+    val DOCUMENT_KEY_SHA256: String
+        get() = BuildConfig.DOCUMENT_KEY_SHA256
 }

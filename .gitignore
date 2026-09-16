@@ -2,8 +2,12 @@
 build/
 app/build/
 local.properties
+visor-secrets.properties
 *.jks
 *.keystore
+*.p12
+*.pfx
+*.pem
 *.apk
 *.aab
 .idea/
@@ -16,11 +20,15 @@ daemon/
 native/
 kotlin-profile/
 .tmp/
-wrapper/
+/wrapper/
 notifications/
 tools/CLAVE_DOCUMENTOS_NO_ENVIAR.txt
+tools/private/
 licencia_*.key
 
+# El wrapper real del proyecto sí debe poder versionarse.
+!gradle/wrapper/
+!gradle/wrapper/**
 
 # ==========================================================
 # DOCUMENT VAULT (NO SUBIR)

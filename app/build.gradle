@@ -1,6 +1,37 @@
+import java.util.Properties
+
 plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
+}
+
+/*
+ * Secretos locales de compilación.
+ *
+ * El archivo visor-secrets.properties NO se versiona. También pueden inyectarse
+ * los mismos valores mediante variables de entorno con el mismo nombre.
+ *
+ * Importante: DOCUMENT_KEY_B64 sigue siendo una medida transitoria para VSDOC1/2;
+ * termina dentro de la APK. VSDOC3 eliminará esta dependencia mediante claves
+ * de contenido protegidas por instalación/Keystore.
+ */
+def localSecrets = new Properties()
+def secretsFile = rootProject.file('visor-secrets.properties')
+if (secretsFile.exists()) {
+    secretsFile.withInputStream { localSecrets.load(it) }
+}
+
+def readLocalValue = { String key, String fallback = '' ->
+    def envValue = System.getenv(key)
+    if (envValue != null && !envValue.trim().isEmpty()) {
+        return envValue.trim()
+    }
+    return localSecrets.getProperty(key, fallback).trim()
+}
+
+def buildConfigString = { String value ->
+    def escaped = value.replace('\\', '\\\\').replace('"', '\\"')
+    return "\"${escaped}\""
 }
 
 android {
@@ -11,8 +42,16 @@ android {
         applicationId 'com.frank.visordocumentoscifrado'
         minSdk 26
         targetSdk 35
-        versionCode 1
-        versionName '1.0.0'
+        versionCode 11
+        versionName '1.2.0'
+
+        buildConfigField 'String', 'DOCUMENT_KEY_B64', buildConfigString(readLocalValue('DOCUMENT_KEY_B64'))
+        buildConfigField 'String', 'DOCUMENT_KEY_SHA256', buildConfigString(readLocalValue('DOCUMENT_KEY_SHA256'))
+        buildConfigField 'String', 'LICENSE_VERIFY_PUBLIC_KEY_B64', buildConfigString(readLocalValue('LICENSE_VERIFY_PUBLIC_KEY_B64'))
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 
     compileOptions {
@@ -25,13 +64,32 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Se instala como app separada: nunca debe confundirse con la APK productiva.
+            applicationIdSuffix '.debug'
+            versionNameSuffix '-debug'
+            minifyEnabled false
+
+            buildConfigField 'boolean', 'ALLOW_LICENSE_BYPASS', 'true'
+            buildConfigField 'boolean', 'TELEGRAM_DIRECT_ENABLED', readLocalValue('TELEGRAM_DIRECT_ENABLED', 'false').toBoolean().toString()
+            buildConfigField 'String', 'TELEGRAM_BOT_TOKEN', buildConfigString(readLocalValue('TELEGRAM_BOT_TOKEN'))
+            buildConfigField 'String', 'TELEGRAM_ADMIN_CHAT_ID', buildConfigString(readLocalValue('TELEGRAM_ADMIN_CHAT_ID'))
+            // Compatibilidad temporal de licencias VISOR_LICENSE_V1 sólo en debug.
+            buildConfigField 'String', 'LEGACY_LICENSE_HMAC_SECRET', buildConfigString(readLocalValue('LEGACY_LICENSE_HMAC_SECRET'))
+        }
+
         release {
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-        }
-        debug {
-            minifyEnabled false
+
+            // Frontera de seguridad: una release nunca puede saltarse la licencia
+            // ni contener el transporte directo de Telegram.
+            buildConfigField 'boolean', 'ALLOW_LICENSE_BYPASS', 'false'
+            buildConfigField 'boolean', 'TELEGRAM_DIRECT_ENABLED', 'false'
+            buildConfigField 'String', 'TELEGRAM_BOT_TOKEN', '""'
+            buildConfigField 'String', 'TELEGRAM_ADMIN_CHAT_ID', '""'
+            buildConfigField 'String', 'LEGACY_LICENSE_HMAC_SECRET', '""'
         }
     }
 }
@@ -44,4 +102,6 @@ dependencies {
     implementation 'androidx.recyclerview:recyclerview:1.3.1'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
     implementation 'com.tom-roush:pdfbox-android:2.0.27.0'
+
+    testImplementation 'junit:junit:4.13.2'
 }

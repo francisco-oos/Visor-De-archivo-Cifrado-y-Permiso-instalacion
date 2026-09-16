@@ -1,23 +1,25 @@
 package com.frank.visordocumentoscifrado.config
 
+import com.frank.visordocumentoscifrado.BuildConfig
+
 /**
- * Canal Telegram de la APK.
+ * Configuración del transporte Telegram legado.
  *
- * Esta V1 usa Telegram solo para transportar:
- * - aviso de instalación,
- * - solicitud de acceso.
+ * Telegram queda únicamente como puente de DESARROLLO. Las credenciales se leen
+ * de visor-secrets.properties/variables de entorno y Gradle sólo las inyecta en
+ * la variante debug. Una APK release siempre recibe campos vacíos y ENABLED=false.
  *
- * La generación/aprobación de licencia.key NO vive en esta APK ni en este repositorio.
- * Ese flujo se construirá después en un frontend/API independiente.
- *
- * Seguridad:
- * - Este token es de prueba. Revócalo en BotFather antes de producción.
- * - Para producción, mover el token a una API intermedia para no exponerlo en la APK.
+ * El transporte productivo se moverá a la API de activación sin cambiar la UI.
  */
 object TelegramConfig {
-    const val ENABLED = true
-    const val BOT_TOKEN = "8654869870:AAFOKWcvaWHRYgFvSwIyBMVYBZGwNANLLYE"
-    const val ADMIN_CHAT_ID = "7483194146"
+    val ENABLED: Boolean
+        get() = BuildConfig.DEBUG && BuildConfig.TELEGRAM_DIRECT_ENABLED
+
+    val BOT_TOKEN: String
+        get() = BuildConfig.TELEGRAM_BOT_TOKEN
+
+    val ADMIN_CHAT_ID: String
+        get() = BuildConfig.TELEGRAM_ADMIN_CHAT_ID
 
     fun isConfigured(): Boolean =
         ENABLED && BOT_TOKEN.isNotBlank() && ADMIN_CHAT_ID.isNotBlank()

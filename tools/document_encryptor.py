@@ -16,7 +16,8 @@ except Exception:
 from app_constants import CATALOG_AREAS, DISPLAY_AREAS, SOURCE_MANUALS_DIR, MANUALS_ASSET_DIR
 
 MAGIC = b"VSDOC2"
-KEY_FILE = "CLAVE_DOCUMENTOS_NO_ENVIAR.txt"
+LEGACY_KEY_FILE = "CLAVE_DOCUMENTOS_NO_ENVIAR.txt"
+SECRETS_FILE = "visor-secrets.properties"
 
 
 def project_root() -> Path:
@@ -31,8 +32,83 @@ def assets_manuals_dir() -> Path:
     return project_root() / "app" / "src" / "main" / "assets" / MANUALS_ASSET_DIR
 
 
-def document_key_config_path() -> Path:
-    return project_root() / "app" / "src" / "main" / "java" / "com" / "frank" / "visordocumentoscifrado" / "config" / "DocumentKeyConfig.kt"
+def secrets_properties_path() -> Path:
+    return project_root() / SECRETS_FILE
+
+
+def read_properties(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+def write_properties(path: Path, values: dict[str, str]):
+    preferred_order = [
+        "DOCUMENT_KEY_B64",
+        "DOCUMENT_KEY_SHA256",
+        "LICENSE_VERIFY_PUBLIC_KEY_B64",
+        "TELEGRAM_DIRECT_ENABLED",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_ADMIN_CHAT_ID",
+        "LEGACY_LICENSE_HMAC_SECRET",
+    ]
+    keys = [k for k in preferred_order if k in values]
+    keys.extend(sorted(k for k in values if k not in keys))
+    body = [
+        "# Archivo local. NO subir a Git.",
+        "# Generado/actualizado por tools/document_encryptor.py.",
+        "",
+    ]
+    body.extend(f"{key}={values[key]}" for key in keys)
+    body.append("")
+    path.write_text("\n".join(body), encoding="utf-8")
+
+
+def save_document_key(key: bytes):
+    if len(key) != 32:
+        raise ValueError("La clave de documentos debe tener 32 bytes (AES-256).")
+    props_path = secrets_properties_path()
+    props = read_properties(props_path)
+    props["DOCUMENT_KEY_B64"] = base64.b64encode(key).decode("ascii")
+    props["DOCUMENT_KEY_SHA256"] = hashlib.sha256(key).hexdigest()
+    props.setdefault("LICENSE_VERIFY_PUBLIC_KEY_B64", "")
+    props.setdefault("TELEGRAM_DIRECT_ENABLED", "false")
+    props.setdefault("TELEGRAM_BOT_TOKEN", "")
+    props.setdefault("TELEGRAM_ADMIN_CHAT_ID", "")
+    props.setdefault("LEGACY_LICENSE_HMAC_SECRET", "")
+    write_properties(props_path, props)
+
+
+def load_or_create_key() -> bytes:
+    # Fuente actual: visor-secrets.properties (fuera de Git).
+    props = read_properties(secrets_properties_path())
+    encoded = props.get("DOCUMENT_KEY_B64", "").strip()
+    if encoded:
+        key = base64.b64decode(encoded)
+        if len(key) != 32:
+            raise ValueError("DOCUMENT_KEY_B64 inválida: debe decodificar a 32 bytes.")
+        save_document_key(key)
+        return key
+
+    # Migración transparente desde el archivo secreto usado por versiones anteriores.
+    legacy_path = Path(__file__).resolve().parent / LEGACY_KEY_FILE
+    if legacy_path.exists():
+        key = base64.b64decode(legacy_path.read_text(encoding="utf-8").strip())
+        if len(key) != 32:
+            raise ValueError(f"{LEGACY_KEY_FILE} contiene una clave inválida.")
+        save_document_key(key)
+        return key
+
+    key = secrets.token_bytes(32)
+    save_document_key(key)
+    return key
 
 
 def safe_filename(value: str) -> str:
@@ -49,42 +125,10 @@ def ensure_folders():
         marker = folder / "PEGA_AQUI_LOS_PDF_DE_ESTA_AREA.txt"
         if not marker.exists():
             marker.write_text(
-                f"Coloca aquí los PDFs del departamento {DISPLAY_AREAS.get(area, area)}.\\n"
-                "Después abre el encriptador y presiona Cifrar y colocar en APK.\\n",
+                f"Coloca aquí los PDFs del departamento {DISPLAY_AREAS.get(area, area)}.\n"
+                "Después abre el encriptador y presiona Cifrar y colocar en APK.\n",
                 encoding="utf-8",
             )
-
-
-def load_or_create_key() -> bytes:
-    path = Path(__file__).resolve().parent / KEY_FILE
-    if path.exists():
-        raw = path.read_text(encoding="utf-8").strip()
-        return base64.b64decode(raw)
-    key = secrets.token_bytes(32)
-    path.write_text(base64.b64encode(key).decode(), encoding="utf-8")
-    return key
-
-
-def update_document_key_config(key: bytes):
-    b64 = base64.b64encode(key).decode()
-    fp = hashlib.sha256(key).hexdigest()
-    path = document_key_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f'''package com.frank.visordocumentoscifrado.config
-
-/**
- * Clave maestra de documentos embebida en la APK.
- *
- * La genera tools/document_encryptor.py al cifrar los manuales.
- * No pertenece a licencia.key. La licencia solo decide qué áreas puede ver el usuario.
- *
- * Si vuelves a cifrar con nueva clave, recompila la APK.
- */
-object DocumentKeyConfig {{
-    const val EMBEDDED_DOCUMENT_KEY_B64 = "{b64}"
-    const val DOCUMENT_KEY_SHA256 = "{fp}"
-}}
-''', encoding="utf-8")
 
 
 def encrypt_pdf(pdf: Path, area_id: str, key: bytes, index: int):
@@ -245,12 +289,14 @@ class DocumentEncryptor(tk.Tk):
         win.geometry("340x120")
         var = tk.StringVar(value=self.selected_area.get())
         ttk.Combobox(win, values=CATALOG_AREAS, textvariable=var, state="readonly").pack(padx=20, pady=15, fill="x")
+
         def ok():
             dest = source_root() / var.get()
             dest.mkdir(parents=True, exist_ok=True)
             shutil.move(str(path), str(dest / path.name))
             win.destroy()
             self.refresh()
+
         ttk.Button(win, text="Mover", command=ok).pack(pady=8)
 
     def delete_pdf(self):
@@ -276,8 +322,11 @@ class DocumentEncryptor(tk.Tk):
         if AESGCM is None:
             messagebox.showerror("Falta dependencia", "Instala: pip install cryptography")
             return
-        key = load_or_create_key()
-        update_document_key_config(key)
+        try:
+            key = load_or_create_key()
+        except Exception as exc:
+            messagebox.showerror("Clave de documentos", str(exc))
+            return
 
         out = assets_manuals_dir()
         out.mkdir(parents=True, exist_ok=True)
@@ -301,9 +350,14 @@ class DocumentEncryptor(tk.Tk):
 
         (out / "index.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        msg = f"Documentos cifrados: {len(manifest)}\\nSalida: {out}\\nDocumentKeyConfig.kt actualizado.\\n\\nAhora recompila la APK."
+        msg = (
+            f"Documentos cifrados: {len(manifest)}\n"
+            f"Salida: {out}\n"
+            f"Clave local guardada en: {secrets_properties_path()}\n\n"
+            "Ahora sincroniza/compila la APK. No subas visor-secrets.properties a Git."
+        )
         if errors:
-            msg += "\\n\\nErrores:\\n" + "\\n".join(errors[:8])
+            msg += "\n\nErrores:\n" + "\n".join(errors[:8])
         self.refresh()
         messagebox.showinfo("Cifrado terminado", msg)
 
