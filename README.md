@@ -1,4 +1,4 @@
-# Visor Seguro de Manuales — R1 + Viewer R2
+# Visor Seguro de Manuales — R1 + Viewer R2.1
 
 Aplicación Android para consultar manuales cifrados por departamento y herramienta Python para preparar documentos VSDOC2.
 
@@ -7,7 +7,8 @@ Aplicación Android para consultar manuales cifrados por departamento y herramie
 Rama de trabajo: `feature/visor-hardening-r1`
 
 - **R1 validado en teléfono:** hardening, configuración, licencias y activación.
-- **Viewer R2 pendiente de validación física:** experiencia gestual, búsqueda asíncrona y render fuera del hilo UI.
+- **Viewer R2 validación física en curso:** experiencia gestual, búsqueda asíncrona y render fuera del hilo UI.
+- **Viewer R2.1 listo para prueba:** resaltado geométrico de cada palabra/frase encontrada.
 - VSDOC3, streaming y render por tiles siguen como etapas posteriores para no mezclar regresiones.
 
 ## Seguridad R1
@@ -23,9 +24,9 @@ Rama de trabajo: `feature/visor-hardening-r1`
 - `FLAG_SECURE` continúa activo.
 - `DocumentAccessGuard` mantiene la autorización justo antes de descifrar.
 
-## Viewer R2 — experiencia de lectura
+## Viewer R2.1 — experiencia de lectura
 
-La versión de prueba es `1.3.0-debug`.
+La versión de prueba es `1.3.1-debug`.
 
 Se reconstruyó la capa de interacción sin copiar el código de otros visores:
 
@@ -39,10 +40,17 @@ Se reconstruyó la capa de interacción sin copiar el código de otros visores:
 - render de `PdfRenderer` en un worker serializado;
 - resultados de render obsoletos se descartan si el usuario avanza rápido;
 - búsqueda PDFBox fuera del hilo principal;
-- una búsqueda obtiene todas las páginas coincidentes una sola vez y permite navegar anterior/siguiente sin reescanear;
+- una búsqueda obtiene todas las ocurrencias una sola vez y permite navegar anterior/siguiente sin reescanear;
+- cada ocurrencia conserva su geometría normalizada 0..1;
+- coincidencias de la página se resaltan de forma translúcida;
+- la coincidencia activa recibe mayor énfasis y borde;
+- frases que ocupan varios renglones pueden producir varios rectángulos;
+- cerrar la búsqueda elimina las marcas sin modificar el PDF original;
 - el panel de búsqueda permanece visible mientras se usa el teclado.
 
 `ViewerZoomPolicy` concentra las reglas matemáticas de zoom/swipe para mantenerlas testeables y separadas de Android.
+
+`PdfSearchEngine` concentra extracción, orden visual, búsqueda y geometría. Los comentarios del código explican por qué se usa `PDFTextStripper.writeString()` para capturar `TextPosition` después del ordenamiento visual.
 
 ## VSDOC actual
 
@@ -100,6 +108,8 @@ Viewer R2 añade `ViewerZoomPolicyTest` para comprobar:
 - cambio de página únicamente al 100 %;
 - rechazo de un gesto predominantemente vertical como cambio de página.
 
+Viewer R2.1 añade un protocolo físico específico para validar posición de resaltados, frases, múltiples ocurrencias y regresión gestual.
+
 No se añadió GitHub Actions para evitar consumo facturable. Las verificaciones se ejecutan localmente.
 
 ## Documentación
@@ -109,11 +119,14 @@ No se añadió GitHub Actions para evitar consumo facturable. Las verificaciones
 - `docs/PRE_CHANGE_VIEWER_R2.md`
 - `docs/POST_CHANGE_VIEWER_R2.md`
 - `docs/PHONE_TEST_VIEWER_R2.md`
+- `docs/POST_CHANGE_SEARCH_HIGHLIGHT_R2_1.md`
+- `docs/PHONE_TEST_SEARCH_HIGHLIGHT_R2_1.md`
+- `docs/COMMENTING_GUIDE.md`
 - `docs/ADR_001_SECURITY_BUILD_BOUNDARIES.md`
 - `docs/ADR_002_ACTIVATION_TRANSPORT.md`
 - `docs/ROADMAP_VSDOC3_VIEWER.md`
 
-## Siguiente etapa después de validar Viewer R2
+## Siguiente etapa después de validar Viewer R2.1
 
 1. `SecureDocumentSession`;
 2. descifrado VSDOC2 por stream hacia almacenamiento privado;

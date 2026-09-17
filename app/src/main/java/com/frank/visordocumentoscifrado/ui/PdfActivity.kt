@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.drawable.GradientDrawable
 import android.graphics.pdf.PdfRenderer
 import android.os.Bundle
@@ -44,10 +45,14 @@ import java.util.concurrent.atomic.AtomicInteger
 /**
  * Visor PDF seguro y gestual.
  *
- * R2 separa tres responsabilidades que antes ocurrían en el hilo de interfaz:
+ * R2/R2.1 separa cuatro responsabilidades:
  * - interacción: ZoomImageView maneja pinch, doble toque, pan, inercia y swipe;
  * - render: PdfRenderer trabaja en un único worker para no congelar la pantalla;
- * - búsqueda: PdfSearchEngine recorre texto mediante PDFBox en Dispatchers.IO.
+ * - búsqueda: PdfSearchEngine recorre texto mediante PDFBox en Dispatchers.IO;
+ * - resaltado: la geometría normalizada de las coincidencias se pinta sobre el bitmap.
+ *
+ * El resaltado NO modifica el PDF. Se dibuja únicamente en memoria sobre la imagen que
+ * ya se muestra en pantalla, por lo que desaparece al cerrar búsqueda o cambiar consulta.
  *
  * Seguridad conservada:
  * - el PDF temporal vive sólo en cache interno;
@@ -100,7 +105,7 @@ class PdfActivity : AppCompatActivity() {
     private var parcelFileDescriptor: ParcelFileDescriptor? = null
     private var searchJob: Job? = null
     private var searchQuery = ""
-    private var searchMatches: List<Int> = emptyList()
+    private var searchOccurrences: List<PdfSearchOccurrence> = emptyList()
     private var searchCursor = -1
 
     private val autoHideRunnable = Runnable { setControlsVisible(false) }
@@ -263,7 +268,7 @@ class PdfActivity : AppCompatActivity() {
             LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         )
         searchRow.addView(actionButton("Ir") { executeSearch(searchBox.text.toString()) })
-        searchRow.addView(actionButton("×") { hideSearchPanel() })
+        searchRow.addView(actionButton("×") { hideSearchPanel(clearResults = true) })
 
         val resultRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -349,7 +354,7 @@ class PdfActivity : AppCompatActivity() {
 
     private fun toggleControls() {
         if (::searchPanel.isInitialized && searchPanel.visibility == View.VISIBLE) {
-            hideSearchPanel()
+            hideSearchPanel(clearResults = true)
             scheduleAutoHide()
             return
         }
@@ -371,7 +376,7 @@ class PdfActivity : AppCompatActivity() {
         }
 
         if (!visible && ::searchPanel.isInitialized && searchPanel.visibility == View.VISIBLE) {
-            hideSearchPanel()
+            hideSearchPanel(clearResults = true)
         }
     }
 
@@ -394,7 +399,11 @@ class PdfActivity : AppCompatActivity() {
         }
     }
 
-    private fun hideSearchPanel() {
+    /**
+     * Cierra el buscador. Si clearResults=true también elimina las marcas del documento.
+     * De esta forma el resaltado existe sólo mientras la sesión de búsqueda está activa.
+     */
+    private fun hideSearchPanel(clearResults: Boolean) {
         searchJob?.cancel()
         searchProgress.visibility = View.GONE
         searchPanel.visibility = View.GONE
@@ -402,6 +411,20 @@ class PdfActivity : AppCompatActivity() {
 
         val keyboard = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
         keyboard.hideSoftInputFromWindow(searchBox.windowToken, 0)
+
+        if (clearResults) clearSearchResultsAndRefresh()
+    }
+
+    private fun clearSearchResultsAndRefresh() {
+        val hadHighlights = searchOccurrences.isNotEmpty()
+        searchQuery = ""
+        searchOccurrences = emptyList()
+        searchCursor = -1
+        searchStatus.text = "Escribe una palabra o frase"
+
+        if (hadHighlights && lastPageCount > 0 && !isFinishing && !isDestroyed) {
+            renderSafely()
+        }
     }
 
     private fun nextPage() {
@@ -466,6 +489,11 @@ class PdfActivity : AppCompatActivity() {
     private fun renderSafely() {
         val targetPage = pageIndex
         val generation = renderGeneration.incrementAndGet()
+
+        // Snapshot inmutable para que una búsqueda nueva no cambie los datos a mitad del render.
+        val occurrenceSnapshot = searchOccurrences
+        val activeCursorSnapshot = searchCursor
+
         pageText.text = "Página ${targetPage + 1} de $lastPageCount · cargando..."
 
         renderExecutor.execute {
@@ -492,6 +520,15 @@ class PdfActivity : AppCompatActivity() {
                         val canvas = Canvas(bitmap)
                         canvas.drawColor(Color.WHITE)
                         page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+
+                        drawSearchHighlights(
+                            canvas = canvas,
+                            width = width,
+                            height = height,
+                            page = targetPage,
+                            occurrences = occurrenceSnapshot,
+                            activeCursor = activeCursorSnapshot
+                        )
                         drawProtectedWatermark(canvas, width, height)
 
                         RenderedPage(bitmap, activeRenderer.pageCount)
@@ -536,6 +573,54 @@ class PdfActivity : AppCompatActivity() {
     }
 
     /**
+     * Dibuja todas las coincidencias de la página y enfatiza la coincidencia activa.
+     *
+     * Los rectángulos llegan normalizados (0..1), por lo que basta multiplicarlos por
+     * el bitmap actual. Esto seguirá funcionando cuando el tamaño de render cambie.
+     */
+    private fun drawSearchHighlights(
+        canvas: Canvas,
+        width: Int,
+        height: Int,
+        page: Int,
+        occurrences: List<PdfSearchOccurrence>,
+        activeCursor: Int
+    ) {
+        if (occurrences.isEmpty()) return
+
+        val normalFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0x66FFD54F
+            style = Paint.Style.FILL
+        }
+        val activeFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0x99FFB300.toInt()
+            style = Paint.Style.FILL
+        }
+        val activeStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xD9F57C00.toInt()
+            style = Paint.Style.STROKE
+            strokeWidth = maxOf(2f, width / 700f)
+        }
+        val corner = maxOf(3f, width / 360f)
+
+        occurrences.forEachIndexed { globalIndex, occurrence ->
+            if (occurrence.pageIndex != page) return@forEachIndexed
+            val active = globalIndex == activeCursor
+
+            occurrence.rects.forEach { normalized ->
+                val rect = RectF(
+                    normalized.left * width,
+                    normalized.top * height,
+                    normalized.right * width,
+                    normalized.bottom * height
+                )
+                canvas.drawRoundRect(rect, corner, corner, if (active) activeFill else normalFill)
+                if (active) canvas.drawRoundRect(rect, corner, corner, activeStroke)
+            }
+        }
+    }
+
+    /**
      * Marca de agua visual de baja opacidad.
      * No sustituye al control criptográfico ni a FLAG_SECURE.
      */
@@ -553,8 +638,8 @@ class PdfActivity : AppCompatActivity() {
     }
 
     /**
-     * Ejecuta una nueva búsqueda completa fuera del hilo UI y conserva las páginas con
-     * coincidencias. Después los botones anterior/siguiente navegan sin volver a escanear.
+     * Ejecuta una nueva búsqueda completa fuera del hilo UI y conserva CADA ocurrencia,
+     * no sólo la página. Esto permite navegar y resaltar palabra/frase por palabra/frase.
      */
     private fun executeSearch(queryRaw: String) {
         val query = queryRaw.trim()
@@ -563,33 +648,36 @@ class PdfActivity : AppCompatActivity() {
             return
         }
 
-        if (query.equals(searchQuery, ignoreCase = true) && searchMatches.isNotEmpty()) {
+        if (query.equals(searchQuery, ignoreCase = true) && searchOccurrences.isNotEmpty()) {
             moveSearchCursor(1)
             return
         }
 
         val file = cacheFile ?: return
         searchJob?.cancel()
+
+        val hadPreviousHighlights = searchOccurrences.isNotEmpty()
         searchQuery = query
-        searchMatches = emptyList()
+        searchOccurrences = emptyList()
         searchCursor = -1
         searchProgress.visibility = View.VISIBLE
         searchStatus.text = "Buscando…"
+        if (hadPreviousHighlights) renderSafely()
 
         searchJob = readerScope.launch {
             try {
-                val matches = withContext(Dispatchers.IO) {
+                val occurrences = withContext(Dispatchers.IO) {
                     val workerJob = coroutineContext[Job]
-                    PdfSearchEngine.findMatchingPages(file, query) {
+                    PdfSearchEngine.findOccurrences(file, query) {
                         workerJob?.isActive != false
                     }
                 }
 
                 if (!isActive) return@launch
                 searchProgress.visibility = View.GONE
-                searchMatches = matches
+                searchOccurrences = occurrences
 
-                if (matches.isEmpty()) {
+                if (occurrences.isEmpty()) {
                     searchStatus.text = "Sin coincidencias"
                     Toast.makeText(
                         this@PdfActivity,
@@ -600,7 +688,8 @@ class PdfActivity : AppCompatActivity() {
                 }
 
                 // Empieza por la primera coincidencia desde la página actual; luego hace wrap.
-                searchCursor = matches.indexOfFirst { it >= pageIndex }.let { if (it >= 0) it else 0 }
+                searchCursor = occurrences.indexOfFirst { it.pageIndex >= pageIndex }
+                    .let { if (it >= 0) it else 0 }
                 navigateToCurrentSearchMatch()
             } catch (e: Exception) {
                 if (!isActive) return@launch
@@ -620,22 +709,23 @@ class PdfActivity : AppCompatActivity() {
     }
 
     private fun moveSearchCursor(direction: Int) {
-        if (searchMatches.isEmpty()) {
+        if (searchOccurrences.isEmpty()) {
             executeSearch(searchBox.text.toString())
             return
         }
 
-        val size = searchMatches.size
+        val size = searchOccurrences.size
         searchCursor = (searchCursor + direction + size) % size
         navigateToCurrentSearchMatch()
     }
 
     private fun navigateToCurrentSearchMatch() {
-        if (searchCursor !in searchMatches.indices) return
+        if (searchCursor !in searchOccurrences.indices) return
 
-        val matchedPage = searchMatches[searchCursor]
-        pageIndex = matchedPage
-        searchStatus.text = "${searchCursor + 1} de ${searchMatches.size} · pág. ${matchedPage + 1}"
+        val occurrence = searchOccurrences[searchCursor]
+        pageIndex = occurrence.pageIndex
+        searchStatus.text =
+            "${searchCursor + 1} de ${searchOccurrences.size} · pág. ${occurrence.pageIndex + 1}"
         renderSafely()
     }
 
