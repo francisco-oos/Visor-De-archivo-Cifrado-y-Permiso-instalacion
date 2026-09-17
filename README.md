@@ -2,14 +2,20 @@
 
 Aplicación Android para consultar manuales cifrados por departamento y herramienta Python para preparar documentos VSDOC2.
 
-## Estado de esta rama
+## Estado estable
 
-Rama de trabajo: `feature/visor-hardening-r1`
+`main` es la rama autoritativa y estable del proyecto.
 
-- **R1 validado en teléfono:** hardening, configuración, licencias y activación.
-- **Viewer R2 validación física en curso:** experiencia gestual, búsqueda asíncrona y render fuera del hilo UI.
-- **Viewer R2.1 listo para prueba:** resaltado geométrico de cada palabra/frase encontrada.
-- VSDOC3, streaming y render por tiles siguen como etapas posteriores para no mezclar regresiones.
+La secuencia R1 → R2 → R2.1 fue desarrollada en rama, validada físicamente en teléfono y después consolidada en `main`.
+
+Versión actual de prueba/validación: `1.3.1-debug`.
+
+Estado:
+
+- **R1 validado:** hardening, configuración, licencias y activación.
+- **Viewer R2 validado:** pinch, doble toque, pan, inercia, swipe controlado, render asíncrono y búsqueda fuera del hilo UI.
+- **Viewer R2.1 validado:** resaltado geométrico de coincidencias y navegación por ocurrencias individuales.
+- VSDOC3, streaming y render por tiles quedan deliberadamente fuera de este cierre.
 
 ## Seguridad R1
 
@@ -26,8 +32,6 @@ Rama de trabajo: `feature/visor-hardening-r1`
 
 ## Viewer R2.1 — experiencia de lectura
 
-La versión de prueba es `1.3.1-debug`.
-
 Se reconstruyó la capa de interacción sin copiar el código de otros visores:
 
 - pinch-to-zoom relativo a la escala real de ajuste de cada página;
@@ -35,18 +39,17 @@ Se reconstruyó la capa de interacción sin copiar el código de otros visores:
 - doble toque animado entre ajuste y zoom de lectura;
 - pan limitado a los bordes del documento;
 - inercia mediante `OverScroller` cuando existe zoom;
-- swipe horizontal de página sólo cuando la hoja está ajustada, evitando confundirlo con paneo;
+- swipe horizontal de página sólo cuando la hoja está ajustada;
 - porcentaje de zoom visible;
 - render de `PdfRenderer` en un worker serializado;
-- resultados de render obsoletos se descartan si el usuario avanza rápido;
+- descarte de renders obsoletos si el usuario avanza rápido;
 - búsqueda PDFBox fuera del hilo principal;
-- una búsqueda obtiene todas las ocurrencias una sola vez y permite navegar anterior/siguiente sin reescanear;
-- cada ocurrencia conserva su geometría normalizada 0..1;
-- coincidencias de la página se resaltan de forma translúcida;
-- la coincidencia activa recibe mayor énfasis y borde;
-- frases que ocupan varios renglones pueden producir varios rectángulos;
-- cerrar la búsqueda elimina las marcas sin modificar el PDF original;
-- el panel de búsqueda permanece visible mientras se usa el teclado.
+- navegación por ocurrencias individuales sin reescanear el PDF;
+- geometría normalizada 0..1 para cada coincidencia;
+- resaltado translúcido de todas las coincidencias visibles;
+- coincidencia activa con mayor énfasis;
+- soporte de frases que ocupan varios renglones mediante varios rectángulos;
+- cierre de búsqueda que elimina las marcas sin modificar el PDF.
 
 `ViewerZoomPolicy` concentra las reglas matemáticas de zoom/swipe para mantenerlas testeables y separadas de Android.
 
@@ -101,16 +104,11 @@ ActivationTransport
 
 R1 incluye pruebas JVM para firma ECDSA V2, reglas AREA/ALL, catálogo y utilidades criptográficas.
 
-Viewer R2 añade `ViewerZoomPolicyTest` para comprobar:
+Viewer R2 añade `ViewerZoomPolicyTest` para comprobar límites de zoom, doble toque y separación correcta entre swipe y paneo.
 
-- límites de zoom relativos;
-- doble toque relativo a `fit-to-page`;
-- cambio de página únicamente al 100 %;
-- rechazo de un gesto predominantemente vertical como cambio de página.
+Viewer R2.1 fue validado físicamente con búsqueda, resaltado, múltiples coincidencias, frases y regresión gestual.
 
-Viewer R2.1 añade un protocolo físico específico para validar posición de resaltados, frases, múltiples ocurrencias y regresión gestual.
-
-No se añadió GitHub Actions para evitar consumo facturable. Las verificaciones se ejecutan localmente.
+No se añadieron GitHub Actions para evitar consumo facturable. Las verificaciones se ejecutan localmente.
 
 ## Documentación
 
@@ -125,8 +123,11 @@ No se añadió GitHub Actions para evitar consumo facturable. Las verificaciones
 - `docs/ADR_001_SECURITY_BUILD_BOUNDARIES.md`
 - `docs/ADR_002_ACTIVATION_TRANSPORT.md`
 - `docs/ROADMAP_VSDOC3_VIEWER.md`
+- `docs/CLOSURE_R2_1.md`
 
-## Siguiente etapa después de validar Viewer R2.1
+## Siguiente etapa futura
+
+El próximo salto técnico queda separado de este cierre:
 
 1. `SecureDocumentSession`;
 2. descifrado VSDOC2 por stream hacia almacenamiento privado;
@@ -134,5 +135,4 @@ No se añadió GitHub Actions para evitar consumo facturable. Las verificaciones
 4. caché por presupuesto de memoria;
 5. VSDOC3 con Streaming AEAD/lectura seekable;
 6. `ProxyFileDescriptor` para evitar un PDF completo en claro;
-7. Vault desacoplado del APK;
-8. integración posterior como Biblioteca dentro de Formatos HSE.
+7. Vault desacoplado del APK.
