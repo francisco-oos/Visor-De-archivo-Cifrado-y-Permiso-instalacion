@@ -8,40 +8,56 @@ import android.graphics.Paint
 import android.graphics.drawable.GradientDrawable
 import android.graphics.pdf.PdfRenderer
 import android.os.Bundle
-import android.os.ParcelFileDescriptor
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.text.InputType
 import android.util.Log
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
-import android.widget.*
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.frank.visordocumentoscifrado.config.SecurityConfig
 import com.frank.visordocumentoscifrado.documents.DocumentRepository
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
-import com.tom_roush.pdfbox.pdmodel.PDDocument
-import com.tom_roush.pdfbox.text.PDFTextStripper
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Visor PDF seguro y fluido.
+ * Visor PDF seguro y gestual.
  *
- * Diseño UX:
- * - Pantalla limpia tipo lector digital.
- * - Un toque: muestra/oculta controles flotantes.
- * - Doble toque: alterna zoom rápido / ajustar pantalla.
- * - Pellizcar: zoom libre.
- * - Arrastrar: mover página cuando está ampliada.
- * - Swipe horizontal: cambiar página cuando no está ampliada.
- * - Controles translúcidos tipo overlay para no tapar la lectura.
+ * R2 separa tres responsabilidades que antes ocurrían en el hilo de interfaz:
+ * - interacción: ZoomImageView maneja pinch, doble toque, pan, inercia y swipe;
+ * - render: PdfRenderer trabaja en un único worker para no congelar la pantalla;
+ * - búsqueda: PdfSearchEngine recorre texto mediante PDFBox en Dispatchers.IO.
  *
- * Seguridad:
- * - El PDF se descifra solamente dentro de cache interno de la app.
- * - No hay botón de compartir/exportar.
- * - Al salir se elimina el archivo temporal.
- * - Respeta FLAG_SECURE para bloquear capturas cuando está activado.
+ * Seguridad conservada:
+ * - el PDF temporal vive sólo en cache interno;
+ * - no existe exportar/compartir;
+ * - FLAG_SECURE continúa bloqueando capturas donde Android lo respeta;
+ * - el archivo temporal se elimina al cerrar.
+ *
+ * Nota de arquitectura:
+ * VSDOC2 todavía se descifra completo antes de llegar aquí. Esa deuda se mantiene
+ * deliberadamente separada para R2A/VSDOC3, donde se migrará a streaming/tiles.
  */
 class PdfActivity : AppCompatActivity() {
     companion object {
@@ -49,7 +65,7 @@ class PdfActivity : AppCompatActivity() {
         var selectedTitle: String = ""
         private const val TAG = "VisorPDF"
 
-        // Límite razonable para evitar OutOfMemory en teléfonos de gama media.
+        // Límite heredado mientras llega el render por tiles de la siguiente etapa.
         private const val MAX_RENDER_WIDTH = 2600
         private const val MAX_RENDER_HEIGHT = 3900
         private const val CONTROLS_AUTO_HIDE_MS = 3800L
@@ -57,6 +73,8 @@ class PdfActivity : AppCompatActivity() {
 
     private var renderer: PdfRenderer? = null
     private var pageIndex = 0
+    private var lastPageCount = 0
+    private var lastZoomRatio = 1f
 
     private lateinit var image: ZoomImageView
     private lateinit var topBar: LinearLayout
@@ -65,14 +83,25 @@ class PdfActivity : AppCompatActivity() {
     private lateinit var titleText: TextView
     private lateinit var pageText: TextView
     private lateinit var searchBox: EditText
+    private lateinit var searchStatus: TextView
+    private lateinit var searchProgress: ProgressBar
     private lateinit var leftPageButton: TextView
     private lateinit var rightPageButton: TextView
 
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val hideHandler = Handler(Looper.getMainLooper())
+    private val renderExecutor = Executors.newSingleThreadExecutor()
+    private val renderGeneration = AtomicInteger(0)
+    private val rendererLock = Any()
+    private val readerScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
     private var controlsVisible = true
     private var cacheFile: File? = null
     private var parcelFileDescriptor: ParcelFileDescriptor? = null
-    private var lastSearch = ""
+    private var searchJob: Job? = null
+    private var searchQuery = ""
+    private var searchMatches: List<Int> = emptyList()
+    private var searchCursor = -1
 
     private val autoHideRunnable = Runnable { setControlsVisible(false) }
 
@@ -84,13 +113,14 @@ class PdfActivity : AppCompatActivity() {
         }
 
         PDFBoxResourceLoader.init(applicationContext)
+        pageIndex = savedInstanceState?.getInt("page_index", 0) ?: 0
         buildReaderUi()
         openPdfSafely()
     }
 
     /**
-     * Construye la pantalla sin XML para mantener el visor autocontenido.
-     * Esto facilita moverlo a otro proyecto HSE más adelante.
+     * Construye la pantalla del lector. Se mantiene programática para que el componente
+     * siga siendo autocontenido y pueda integrarse posteriormente como Biblioteca HSE.
      */
     private fun buildReaderUi() {
         val root = FrameLayout(this).apply {
@@ -103,6 +133,10 @@ class PdfActivity : AppCompatActivity() {
             onSwipeRight = { prevPage() }
             onSingleTap = { toggleControls() }
             onInteraction = { scheduleAutoHide() }
+            onZoomChanged = { ratio ->
+                lastZoomRatio = ratio
+                if (lastPageCount > 0) updatePageText(lastPageCount)
+            }
         }
 
         root.addView(
@@ -159,6 +193,7 @@ class PdfActivity : AppCompatActivity() {
                 .apply { setMargins(0, 0, dp(10), 0) }
         )
 
+        // Barra mínima: las funciones importantes siguen disponibles sin depender de gestos.
         bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -180,13 +215,27 @@ class PdfActivity : AppCompatActivity() {
             ).apply { setMargins(dp(12), 0, dp(12), dp(18)) }
         )
 
+        buildSearchPanel(root)
+        setContentView(root)
+        scheduleAutoHide()
+    }
+
+    /**
+     * Panel de búsqueda inspirado en lectores modernos: entrada persistente, anterior/
+     * siguiente y contador de coincidencias. La búsqueda real ocurre fuera del hilo UI.
+     */
+    private fun buildSearchPanel(root: FrameLayout) {
         searchPanel = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+            orientation = LinearLayout.VERTICAL
             visibility = View.GONE
             setPadding(dp(12), dp(10), dp(12), dp(10))
             background = roundedBackground(0xEE0B2545.toInt(), dp(18).toFloat())
             elevation = dp(12).toFloat()
+        }
+
+        val searchRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
         }
 
         searchBox = EditText(this).apply {
@@ -194,14 +243,60 @@ class PdfActivity : AppCompatActivity() {
             setTextColor(Color.WHITE)
             setHintTextColor(0xFF9FB3C8.toInt())
             inputType = InputType.TYPE_CLASS_TEXT
+            imeOptions = EditorInfo.IME_ACTION_SEARCH
             setSingleLine(true)
             backgroundTintList = android.content.res.ColorStateList.valueOf(0xFF86A8C7.toInt())
+            setOnEditorActionListener { _, actionId, event ->
+                val pressedEnter = event?.keyCode == KeyEvent.KEYCODE_ENTER &&
+                    event?.action == KeyEvent.ACTION_UP
+                if (actionId == EditorInfo.IME_ACTION_SEARCH || pressedEnter) {
+                    executeSearch(searchBox.text.toString())
+                    true
+                } else {
+                    false
+                }
+            }
         }
 
-        searchPanel.addView(searchBox, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        searchPanel.addView(actionButton("Ir") { searchInPdf(searchBox.text.toString(), false) })
-        searchPanel.addView(actionButton("Sig.") { searchInPdf(searchBox.text.toString().ifBlank { lastSearch }, true) })
-        searchPanel.addView(actionButton("×") { hideSearchPanel() })
+        searchRow.addView(
+            searchBox,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        searchRow.addView(actionButton("Ir") { executeSearch(searchBox.text.toString()) })
+        searchRow.addView(actionButton("×") { hideSearchPanel() })
+
+        val resultRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val previous = actionButton("‹") { moveSearchCursor(-1) }
+        val next = actionButton("›") { moveSearchCursor(1) }
+
+        searchStatus = TextView(this).apply {
+            text = "Escribe una palabra o frase"
+            setTextColor(0xFFD7E5F3.toInt())
+            textSize = 12f
+            gravity = Gravity.CENTER
+        }
+
+        searchProgress = ProgressBar(this).apply {
+            visibility = View.GONE
+        }
+
+        resultRow.addView(previous)
+        resultRow.addView(
+            searchStatus,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        resultRow.addView(
+            searchProgress,
+            LinearLayout.LayoutParams(dp(28), dp(28)).apply { setMargins(dp(6), 0, dp(6), 0) }
+        )
+        resultRow.addView(next)
+
+        searchPanel.addView(searchRow)
+        searchPanel.addView(resultRow)
 
         root.addView(
             searchPanel,
@@ -211,9 +306,6 @@ class PdfActivity : AppCompatActivity() {
                 Gravity.BOTTOM
             ).apply { setMargins(dp(12), 0, dp(12), dp(82)) }
         )
-
-        setContentView(root)
-        scheduleAutoHide()
     }
 
     private fun actionButton(textValue: String, action: () -> Unit): TextView =
@@ -226,7 +318,10 @@ class PdfActivity : AppCompatActivity() {
             background = roundedBackground(0x334C8AB8, dp(14).toFloat())
             setOnClickListener {
                 action()
-                scheduleAutoHide()
+                // Si Buscar está abierto no iniciamos el auto-ocultado detrás del teclado.
+                if (!::searchPanel.isInitialized || searchPanel.visibility != View.VISIBLE) {
+                    scheduleAutoHide()
+                }
             }
         }
 
@@ -253,6 +348,12 @@ class PdfActivity : AppCompatActivity() {
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     private fun toggleControls() {
+        if (::searchPanel.isInitialized && searchPanel.visibility == View.VISIBLE) {
+            hideSearchPanel()
+            scheduleAutoHide()
+            return
+        }
+
         setControlsVisible(!controlsVisible)
         if (controlsVisible) scheduleAutoHide()
     }
@@ -261,17 +362,22 @@ class PdfActivity : AppCompatActivity() {
         controlsVisible = visible
         val alphaTarget = if (visible) 1f else 0f
         val visibilityEnd = if (visible) View.VISIBLE else View.GONE
-        listOf(topBar, bottomBar, leftPageButton, rightPageButton).forEach { v ->
-            if (visible) v.visibility = View.VISIBLE
-            v.animate().alpha(alphaTarget).setDuration(160).withEndAction {
-                if (!visible) v.visibility = visibilityEnd
+
+        listOf(topBar, bottomBar, leftPageButton, rightPageButton).forEach { view ->
+            if (visible) view.visibility = View.VISIBLE
+            view.animate().alpha(alphaTarget).setDuration(160).withEndAction {
+                if (!visible) view.visibility = visibilityEnd
             }.start()
         }
-        if (!visible) hideSearchPanel()
+
+        if (!visible && ::searchPanel.isInitialized && searchPanel.visibility == View.VISIBLE) {
+            hideSearchPanel()
+        }
     }
 
     private fun scheduleAutoHide() {
         hideHandler.removeCallbacks(autoHideRunnable)
+        if (::searchPanel.isInitialized && searchPanel.visibility == View.VISIBLE) return
         hideHandler.postDelayed(autoHideRunnable, CONTROLS_AUTO_HIDE_MS)
     }
 
@@ -279,22 +385,32 @@ class PdfActivity : AppCompatActivity() {
         setControlsVisible(true)
         searchPanel.visibility = View.VISIBLE
         searchPanel.alpha = 1f
-        searchBox.requestFocus()
         hideHandler.removeCallbacks(autoHideRunnable)
+        searchBox.requestFocus()
+
+        searchBox.post {
+            val keyboard = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+            keyboard.showSoftInput(searchBox, InputMethodManager.SHOW_IMPLICIT)
+        }
     }
 
     private fun hideSearchPanel() {
+        searchJob?.cancel()
+        searchProgress.visibility = View.GONE
         searchPanel.visibility = View.GONE
+        searchBox.clearFocus()
+
+        val keyboard = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+        keyboard.hideSoftInputFromWindow(searchBox.windowToken, 0)
     }
 
     private fun nextPage() {
-        renderer?.let {
-            if (pageIndex < it.pageCount - 1) {
-                pageIndex++
-                renderSafely()
-            } else {
-                Toast.makeText(this, "Última página", Toast.LENGTH_SHORT).show()
-            }
+        if (lastPageCount <= 0) return
+        if (pageIndex < lastPageCount - 1) {
+            pageIndex++
+            renderSafely()
+        } else {
+            Toast.makeText(this, "Última página", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -312,7 +428,9 @@ class PdfActivity : AppCompatActivity() {
             if (selectedFile.isBlank()) throw IllegalStateException("No se seleccionó ningún documento.")
 
             val doc = DocumentRepository.listAllowed(this).firstOrNull { it.file == selectedFile }
-                ?: throw IllegalStateException("No se encontró el documento o no está permitido para esta licencia: $selectedFile")
+                ?: throw IllegalStateException(
+                    "No se encontró el documento o no está permitido para esta licencia: $selectedFile"
+                )
 
             titleText.text = doc.title
             pageText.text = "Abriendo documento..."
@@ -327,8 +445,10 @@ class PdfActivity : AppCompatActivity() {
 
             parcelFileDescriptor = ParcelFileDescriptor.open(cacheFile, ParcelFileDescriptor.MODE_READ_ONLY)
             renderer = PdfRenderer(parcelFileDescriptor!!)
+            lastPageCount = renderer?.pageCount ?: 0
 
-            if ((renderer?.pageCount ?: 0) <= 0) throw IllegalStateException("El PDF no tiene páginas legibles.")
+            if (lastPageCount <= 0) throw IllegalStateException("El PDF no tiene páginas legibles.")
+            pageIndex = pageIndex.coerceIn(0, lastPageCount - 1)
             renderSafely()
         } catch (e: Exception) {
             Log.e(TAG, "Error abriendo PDF", e)
@@ -337,54 +457,87 @@ class PdfActivity : AppCompatActivity() {
     }
 
     /**
-     * Renderiza una página como bitmap con resolución suficiente para zoom moderado,
-     * sin exceder límites de memoria.
+     * Renderiza la página en un worker único.
+     *
+     * PdfRenderer permite sólo una página abierta a la vez; por eso no usamos un pool de
+     * múltiples threads. renderGeneration descarta resultados antiguos cuando el usuario
+     * pasa varias páginas rápidamente y evita que aparezca una página atrasada.
      */
     private fun renderSafely() {
-        try {
-            val r = renderer ?: return
-            val page = r.openPage(pageIndex)
+        val targetPage = pageIndex
+        val generation = renderGeneration.incrementAndGet()
+        pageText.text = "Página ${targetPage + 1} de $lastPageCount · cargando..."
 
+        renderExecutor.execute {
             try {
-                val screenWidth = resources.displayMetrics.widthPixels
-                val renderWidth = (screenWidth * 2).coerceIn(screenWidth, MAX_RENDER_WIDTH)
-                var scale = renderWidth.toFloat() / page.width.toFloat()
-                var width = (page.width * scale).toInt().coerceAtLeast(1)
-                var height = (page.height * scale).toInt().coerceAtLeast(1)
+                val rendered = synchronized(rendererLock) {
+                    val activeRenderer = renderer ?: return@synchronized null
+                    if (targetPage !in 0 until activeRenderer.pageCount) return@synchronized null
 
-                if (height > MAX_RENDER_HEIGHT) {
-                    scale = MAX_RENDER_HEIGHT.toFloat() / page.height.toFloat()
-                    width = (page.width * scale).toInt().coerceAtLeast(1)
-                    height = (page.height * scale).toInt().coerceAtLeast(1)
+                    val page = activeRenderer.openPage(targetPage)
+                    try {
+                        val screenWidth = resources.displayMetrics.widthPixels
+                        val renderWidth = (screenWidth * 2).coerceIn(screenWidth, MAX_RENDER_WIDTH)
+                        var scale = renderWidth.toFloat() / page.width.toFloat()
+                        var width = (page.width * scale).toInt().coerceAtLeast(1)
+                        var height = (page.height * scale).toInt().coerceAtLeast(1)
+
+                        if (height > MAX_RENDER_HEIGHT) {
+                            scale = MAX_RENDER_HEIGHT.toFloat() / page.height.toFloat()
+                            width = (page.width * scale).toInt().coerceAtLeast(1)
+                            height = (page.height * scale).toInt().coerceAtLeast(1)
+                        }
+
+                        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                        val canvas = Canvas(bitmap)
+                        canvas.drawColor(Color.WHITE)
+                        page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        drawProtectedWatermark(canvas, width, height)
+
+                        RenderedPage(bitmap, activeRenderer.pageCount)
+                    } finally {
+                        page.close()
+                    }
+                } ?: return@execute
+
+                mainHandler.post {
+                    if (isFinishing || isDestroyed || generation != renderGeneration.get()) {
+                        rendered.bitmap.recycle()
+                        return@post
+                    }
+
+                    lastPageCount = rendered.pageCount
+                    lastZoomRatio = 1f
+                    image.setImageBitmap(rendered.bitmap)
+                    updatePageText(lastPageCount)
                 }
-
-                val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                val canvas = Canvas(bmp)
-                canvas.drawColor(Color.WHITE)
-                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                drawProtectedWatermark(canvas, width, height)
-
-                image.setImageBitmap(bmp)
-                updatePageText(r.pageCount)
-            } finally {
-                page.close()
+            } catch (oom: OutOfMemoryError) {
+                Log.e(TAG, "Sin memoria renderizando PDF", oom)
+                mainHandler.post {
+                    showFatalError(
+                        "El PDF es demasiado pesado para este teléfono.",
+                        "El render por regiones/tiles está previsto para la siguiente etapa del visor."
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error renderizando PDF", e)
+                mainHandler.post {
+                    if (!isFinishing && !isDestroyed) {
+                        showFatalError("No se pudo mostrar la página.", friendlyError(e))
+                    }
+                }
             }
-        } catch (oom: OutOfMemoryError) {
-            Log.e(TAG, "Sin memoria renderizando PDF", oom)
-            showFatalError("El PDF es demasiado pesado para este teléfono.", "Comprime el PDF o divide el manual en archivos más pequeños.")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error renderizando PDF", e)
-            showFatalError("No se pudo mostrar la página.", friendlyError(e))
         }
     }
 
     private fun updatePageText(totalPages: Int) {
-        pageText.text = "Página ${pageIndex + 1} de $totalPages · pellizca para ampliar · doble toque para zoom"
+        val zoomPercent = (lastZoomRatio * 100f).toInt().coerceAtLeast(100)
+        pageText.text = "Página ${pageIndex + 1} de $totalPages · $zoomPercent %"
     }
 
     /**
-     * Marca de agua con baja opacidad.
-     * No es la protección principal; solo refuerza visualmente que es consulta interna.
+     * Marca de agua visual de baja opacidad.
+     * No sustituye al control criptográfico ni a FLAG_SECURE.
      */
     private fun drawProtectedWatermark(canvas: Canvas, width: Int, height: Int) {
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -399,65 +552,114 @@ class PdfActivity : AppCompatActivity() {
         canvas.restore()
     }
 
-    private fun searchInPdf(queryRaw: String, fromNext: Boolean) {
+    /**
+     * Ejecuta una nueva búsqueda completa fuera del hilo UI y conserva las páginas con
+     * coincidencias. Después los botones anterior/siguiente navegan sin volver a escanear.
+     */
+    private fun executeSearch(queryRaw: String) {
         val query = queryRaw.trim()
         if (query.isBlank()) {
-            Toast.makeText(this, "Escribe una palabra o frase", Toast.LENGTH_SHORT).show()
+            searchStatus.text = "Escribe una palabra o frase"
+            return
+        }
+
+        if (query.equals(searchQuery, ignoreCase = true) && searchMatches.isNotEmpty()) {
+            moveSearchCursor(1)
             return
         }
 
         val file = cacheFile ?: return
+        searchJob?.cancel()
+        searchQuery = query
+        searchMatches = emptyList()
+        searchCursor = -1
+        searchProgress.visibility = View.VISIBLE
+        searchStatus.text = "Buscando…"
 
-        try {
-            lastSearch = query
-            pageText.text = "Buscando: $query..."
-
-            PDDocument.load(file).use { doc ->
-                val stripper = PDFTextStripper()
-                val pageCount = doc.numberOfPages
-                val start = if (fromNext) pageIndex + 1 else pageIndex
-                val order = ((start until pageCount) + (0 until start)).distinct()
-
-                for (p in order) {
-                    stripper.startPage = p + 1
-                    stripper.endPage = p + 1
-                    val text = stripper.getText(doc)
-                    if (text.contains(query, ignoreCase = true)) {
-                        pageIndex = p
-                        renderSafely()
-                        Toast.makeText(this, "Encontrado en página ${p + 1}", Toast.LENGTH_LONG).show()
-                        return
+        searchJob = readerScope.launch {
+            try {
+                val matches = withContext(Dispatchers.IO) {
+                    val workerJob = coroutineContext[Job]
+                    PdfSearchEngine.findMatchingPages(file, query) {
+                        workerJob?.isActive != false
                     }
                 }
 
-                Toast.makeText(this, "No se encontró: $query", Toast.LENGTH_LONG).show()
-                renderSafely()
+                if (!isActive) return@launch
+                searchProgress.visibility = View.GONE
+                searchMatches = matches
+
+                if (matches.isEmpty()) {
+                    searchStatus.text = "Sin coincidencias"
+                    Toast.makeText(
+                        this@PdfActivity,
+                        "No se encontró “$query”. Si el PDF es escaneado puede no contener texto.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    return@launch
+                }
+
+                // Empieza por la primera coincidencia desde la página actual; luego hace wrap.
+                searchCursor = matches.indexOfFirst { it >= pageIndex }.let { if (it >= 0) it else 0 }
+                navigateToCurrentSearchMatch()
+            } catch (e: Exception) {
+                if (!isActive) return@launch
+                Log.e(TAG, "Error buscando texto", e)
+                searchProgress.visibility = View.GONE
+                searchStatus.text = "No se pudo buscar"
+                AlertDialog.Builder(this@PdfActivity)
+                    .setTitle("No se pudo buscar")
+                    .setMessage(
+                        "Algunos PDFs escaneados son imágenes y no contienen texto buscable. " +
+                            "Detalle: ${e.message}"
+                    )
+                    .setPositiveButton("OK", null)
+                    .show()
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error buscando texto", e)
-            AlertDialog.Builder(this)
-                .setTitle("No se pudo buscar")
-                .setMessage("Algunos PDFs escaneados son imágenes y no contienen texto buscable. Error: ${e.message}")
-                .setPositiveButton("OK", null)
-                .show()
-            renderSafely()
         }
+    }
+
+    private fun moveSearchCursor(direction: Int) {
+        if (searchMatches.isEmpty()) {
+            executeSearch(searchBox.text.toString())
+            return
+        }
+
+        val size = searchMatches.size
+        searchCursor = (searchCursor + direction + size) % size
+        navigateToCurrentSearchMatch()
+    }
+
+    private fun navigateToCurrentSearchMatch() {
+        if (searchCursor !in searchMatches.indices) return
+
+        val matchedPage = searchMatches[searchCursor]
+        pageIndex = matchedPage
+        searchStatus.text = "${searchCursor + 1} de ${searchMatches.size} · pág. ${matchedPage + 1}"
+        renderSafely()
     }
 
     private fun friendlyError(e: Exception): String {
         val msg = e.message ?: e.javaClass.simpleName
         return when {
-            msg.contains("AEADBadTag", true) || msg.contains("BAD_DECRYPT", true) || msg.contains("BadPadding", true) || msg.contains("tag", true) ->
+            msg.contains("AEADBadTag", true) ||
+                msg.contains("BAD_DECRYPT", true) ||
+                msg.contains("BadPadding", true) ||
+                msg.contains("tag", true) ->
                 "La APK fue compilada con una clave distinta a la usada para cifrar estos documentos. Vuelve a cifrar manuales con la herramienta y recompila la APK."
+
             msg.contains("Integridad", true) ->
                 "Falló la verificación de integridad. El .bin o el index.json no corresponden al PDF cifrado."
+
             msg.contains("password", true) || msg.contains("encrypted", true) ->
                 "El PDF original parece estar protegido con contraseña o cifrado. Quita esa protección antes de cifrarlo para la app."
+
             else -> msg
         }
     }
 
     private fun showFatalError(title: String, message: String) {
+        if (isFinishing || isDestroyed) return
         AlertDialog.Builder(this)
             .setTitle(title)
             .setMessage(message)
@@ -466,11 +668,31 @@ class PdfActivity : AppCompatActivity() {
             .show()
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putInt("page_index", pageIndex)
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onDestroy() {
         hideHandler.removeCallbacks(autoHideRunnable)
-        try { renderer?.close() } catch (_: Exception) {}
-        try { parcelFileDescriptor?.close() } catch (_: Exception) {}
+        searchJob?.cancel()
+        readerScope.cancel()
+        renderGeneration.incrementAndGet()
+        renderExecutor.shutdownNow()
+
+        synchronized(rendererLock) {
+            try { renderer?.close() } catch (_: Exception) {}
+            renderer = null
+            try { parcelFileDescriptor?.close() } catch (_: Exception) {}
+            parcelFileDescriptor = null
+        }
+
         cacheFile?.delete()
         super.onDestroy()
     }
+
+    private data class RenderedPage(
+        val bitmap: Bitmap,
+        val pageCount: Int
+    )
 }

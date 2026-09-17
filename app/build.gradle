@@ -42,8 +42,8 @@ android {
         applicationId 'com.frank.visordocumentoscifrado'
         minSdk 26
         targetSdk 35
-        versionCode 11
-        versionName '1.2.0'
+        versionCode 12
+        versionName '1.3.0'
 
         buildConfigField 'String', 'DOCUMENT_KEY_B64', buildConfigString(readLocalValue('DOCUMENT_KEY_B64'))
         buildConfigField 'String', 'DOCUMENT_KEY_SHA256', buildConfigString(readLocalValue('DOCUMENT_KEY_SHA256'))
